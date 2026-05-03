@@ -516,4 +516,84 @@ impl FacetHub {
             }
         }
     }
+
+    /// Import plan epics from a workspace directory into trak facets.
+    ///
+    /// Scans for `plans/` directories across all repos in the workspace,
+    /// parses markdown tickets (frontmatter and inline formats), creates
+    /// a facet hierarchy (repo → epic → ticket), and wires dependency edges.
+    #[plexus_macros::method(params(
+        path = "Path to workspace root directory to scan for plans/",
+        dry_run = "Preview without creating facets (default: false)"
+    ))]
+    pub async fn import_plans(
+        &self,
+        auth: &AuthContext,
+        path: String,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let store = self.store.clone();
+        let owner = owner_from_auth(auth);
+        let tenant = tenant_from_auth(auth);
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        stream! {
+            let workspace_path = std::path::Path::new(&path);
+            if !workspace_path.is_dir() {
+                yield TrakEvent::Error {
+                    code: Some("invalid_path".into()),
+                    message: format!("Not a directory: {path}"),
+                };
+                return;
+            }
+
+            yield TrakEvent::Info {
+                message: format!("Scanning {} for plan files...", path),
+            };
+
+            let tickets = crate::import::scan_plans(workspace_path);
+
+            yield TrakEvent::Info {
+                message: format!("Found {} tickets across {} epics",
+                    tickets.len(),
+                    tickets.iter().map(|t| &t.epic).collect::<std::collections::HashSet<_>>().len(),
+                ),
+            };
+
+            // Show what we found
+            let mut by_repo: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+            for t in &tickets {
+                by_repo.entry(&t.repo).or_default().push(&t.id);
+            }
+            for (repo, ids) in &by_repo {
+                yield TrakEvent::Info {
+                    message: format!("  {}: {} tickets", repo, ids.len()),
+                };
+            }
+
+            if is_dry_run {
+                yield TrakEvent::Info {
+                    message: "[dry run] Would import the above. Pass --dry_run false to create facets.".into(),
+                };
+                return;
+            }
+
+            let report = crate::import::import_into_trak(
+                store.as_ref(),
+                &tickets,
+                &owner,
+                tenant.as_deref(),
+            ).await;
+
+            yield TrakEvent::Info {
+                message: format!(
+                    "Import complete: {} repos, {} epics, {} tickets, {} dependency edges",
+                    report.repos_created,
+                    report.epics_created,
+                    report.tickets_created,
+                    report.edges_created,
+                ),
+            };
+        }
+    }
 }

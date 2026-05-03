@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod events;
 pub mod hubs;
+pub mod import;
 pub mod index;
 pub mod store;
 pub mod types;

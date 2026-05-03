@@ -25,7 +25,11 @@ impl TrakAuth {
 
 #[async_trait]
 impl SessionValidator for TrakAuth {
-    async fn validate(&self, token: &str) -> Option<AuthContext> {
+    async fn validate(&self, cookie_header: &str) -> Option<AuthContext> {
+        // Extract token from cookie header or treat as raw token.
+        // Cookie header format: "access_token=eyJ...; other=val"
+        let token = extract_token_from_cookies(cookie_header);
+
         // 1. Try JWT decode
         if let Some(ctx) = self.try_jwt(token) {
             return Some(ctx);
@@ -34,6 +38,24 @@ impl SessionValidator for TrakAuth {
         // 2. Try API key lookup
         self.try_api_key(token).await
     }
+}
+
+/// Parse cookie header for `access_token` value, or return the raw string
+/// if it looks like a bare token (no `=` sign).
+fn extract_token_from_cookies(cookie_header: &str) -> &str {
+    // If it doesn't contain '=', treat as a raw token
+    if !cookie_header.contains('=') {
+        return cookie_header.trim();
+    }
+    // Parse cookie pairs
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some(val) = pair.strip_prefix("access_token=") {
+            return val.trim();
+        }
+    }
+    // Fallback: try the whole string as a token
+    cookie_header.trim()
 }
 
 impl TrakAuth {

@@ -517,6 +517,95 @@ impl FacetHub {
         }
     }
 
+    /// Regex search across facet titles and bodies
+    #[plexus_macros::method(
+        description = "Search facets by regex pattern against title and body. Returns all matches.",
+        params(
+            pattern = "Regex pattern (Rust regex syntax)",
+            status = "Filter by status (optional)",
+            parent_id = "Scope to children of this facet (optional)"
+        )
+    )]
+    async fn grep(
+        &self,
+        pattern: String,
+        status: Option<String>,
+        parent_id: Option<String>,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let store = self.store.clone();
+        stream! {
+            let re = match regex::Regex::new(&pattern) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("invalid_regex".into()),
+                        message: format!("Bad pattern: {e}"),
+                    };
+                    return;
+                }
+            };
+
+            // Load facets to scan
+            let facets = if let Some(ref pid) = parent_id {
+                match uuid::Uuid::parse_str(pid) {
+                    Ok(parent_uuid) => {
+                        // Get full subtree under parent
+                        match store.get_subtree(parent_uuid).await {
+                            Ok(items) => items.into_iter().map(|(f, _depth)| f).collect::<Vec<_>>(),
+                            Err(e) => {
+                                yield TrakEvent::Error { code: Some("grep_failed".into()), message: e.to_string() };
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield TrakEvent::Error { code: Some("invalid_id".into()), message: e.to_string() };
+                        return;
+                    }
+                }
+            } else {
+                // Scan all roots + their subtrees
+                match store.list_roots().await {
+                    Ok(roots) => {
+                        let mut all = Vec::new();
+                        for root in &roots {
+                            all.push(root.clone());
+                            if let Ok(children) = store.get_subtree(root.id).await {
+                                all.extend(children.into_iter().map(|(f, _)| f));
+                            }
+                        }
+                        all
+                    }
+                    Err(e) => {
+                        yield TrakEvent::Error { code: Some("grep_failed".into()), message: e.to_string() };
+                        return;
+                    }
+                }
+            };
+
+            let mut count = 0u32;
+            for facet in &facets {
+                // Filter by status if specified
+                if let Some(ref s) = status {
+                    if &facet.status != s { continue; }
+                }
+
+                let title_match = re.is_match(&facet.title);
+                let body_match = facet.body.as_deref().is_some_and(|b| re.is_match(b));
+
+                if title_match || body_match {
+                    yield TrakEvent::SearchResult {
+                        facet: facet.clone(),
+                        score: None,
+                    };
+                    count += 1;
+                }
+            }
+
+            yield TrakEvent::Info { message: format!("{count} matches") };
+        }
+    }
+
     /// Import plan epics from a workspace directory into trak facets.
     ///
     /// Scans for `plans/` directories across all repos in the workspace,

@@ -1,244 +1,295 @@
 #!/usr/bin/env bash
-# launch-agent.sh — Pick a facet from trak, spawn a Claude Code session
+# launch-agent.sh — CLI for trak facets + spawning Claude Code agents
 #
 # Usage:
-#   ./launch-agent.sh                    # interactive: browse tree, pick a facet
-#   ./launch-agent.sh <facet-id>         # direct: launch agent for specific facet
-#   ./launch-agent.sh --list             # show open facets
-#   ./launch-agent.sh --blocked          # show blocked facets
-#   ./launch-agent.sh --search "query"   # search facets
+#   launch-agent.sh ls                       List root facets
+#   launch-agent.sh ls hyperforge            List children (name or ID prefix)
+#   launch-agent.sh ls hyperforge/MFORGE     Drill deeper with /
+#   launch-agent.sh show <name-or-id>        Show facet detail
+#   launch-agent.sh tree <name-or-id>        Show subtree
+#   launch-agent.sh search <query>           Full-text search
+#   launch-agent.sh blocked                  Show blocked facets
+#   launch-agent.sh launch <name-or-id>      Spawn Claude Code agent for facet
+#   launch-agent.sh status <name-or-id> <s>  Update status
 #
-# Requires:
-#   - trak running on port 44107 (or TRAK_PORT env)
-#   - substrate running on port 4444 (or SUBSTRATE_PORT env)
-#   - TRAK_TOKEN env var or ~/.plexus/trak/token file
-#   - synapse CLI
+# Names are fuzzy-matched against titles. Short ID prefixes work too.
 
 set -euo pipefail
 
 TRAK_PORT="${TRAK_PORT:-44107}"
 SUBSTRATE_PORT="${SUBSTRATE_PORT:-4444}"
 MODEL="${CLAUDE_MODEL:-sonnet}"
+TOKEN_FILE="${HOME}/.plexus/trak/token"
 
 # ── Token ────────────────────────────────────────────────────────────────────
 
-TOKEN_FILE="${HOME}/.plexus/trak/token"
-
 resolve_token() {
-    # 1. Env var
-    if [[ -n "${TRAK_TOKEN:-}" ]]; then
-        echo "$TRAK_TOKEN"
-        return
-    fi
-    # 2. Saved token file
-    if [[ -f "$TOKEN_FILE" ]]; then
-        local saved
-        saved=$(cat "$TOKEN_FILE")
-        if [[ -n "$saved" ]]; then
-            echo "$saved"
-            return
-        fi
-    fi
-    # 3. Interactive login
+    [[ -n "${TRAK_TOKEN:-}" ]] && { echo "$TRAK_TOKEN"; return; }
+    [[ -f "$TOKEN_FILE" ]] && { cat "$TOKEN_FILE"; return; }
     login_interactive
 }
 
 login_interactive() {
-    echo "No saved trak credential."
-    read -rp "Username: " username
-    read -rsp "Password: " password
-    echo ""
+    echo "No saved trak credential." >&2
+    read -rp "Username: " username >/dev/tty
+    read -rsp "Password: " password >/dev/tty
+    echo "" >&2
 
-    # Try login first
-    local result
+    local result token
     result=$(synapse -P "$TRAK_PORT" --json trak identity login \
         --username "$username" --password "$password" 2>&1)
-
-    local token
     token=$(echo "$result" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
 
-    # If login failed, register then login
     if [[ -z "$token" ]]; then
-        echo "User not found — registering..."
-        read -rp "Display name (optional): " display_name
-        read -rp "Tenant (optional): " tenant
-
+        echo "User not found — registering..." >&2
+        read -rp "Tenant (optional): " tenant >/dev/tty
         local reg_args="--username $username --password $password"
-        [[ -n "$display_name" ]] && reg_args="$reg_args --display_name $display_name"
         [[ -n "$tenant" ]] && reg_args="$reg_args --tenant $tenant"
-
-        local reg_result
-        reg_result=$(synapse -P "$TRAK_PORT" --json trak identity register $reg_args 2>&1)
-
-        if echo "$reg_result" | grep -q '"user_registered"'; then
-            echo "Registered. Logging in..."
-            result=$(synapse -P "$TRAK_PORT" --json trak identity login \
-                --username "$username" --password "$password" 2>&1)
-            token=$(echo "$result" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
-        fi
-
-        if [[ -z "$token" ]]; then
-            echo "Registration/login failed." >&2
-            echo "$reg_result" | grep '"message"' >&2
-            exit 1
-        fi
+        synapse -P "$TRAK_PORT" --json trak identity register $reg_args >/dev/null 2>&1
+        result=$(synapse -P "$TRAK_PORT" --json trak identity login \
+            --username "$username" --password "$password" 2>&1)
+        token=$(echo "$result" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
 
-    # Save for future use
+    [[ -z "$token" ]] && { echo "Auth failed." >&2; exit 1; }
     mkdir -p "$(dirname "$TOKEN_FILE")"
     echo "$token" > "$TOKEN_FILE"
     chmod 600 "$TOKEN_FILE"
-    echo "Authenticated as $username. Token saved."
+    echo "Authenticated." >&2
     echo "$token"
 }
 
 TOKEN=$(resolve_token)
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+trak() { synapse -P "$TRAK_PORT" --json -t "$TOKEN" trak "$@" 2>&1; }
+substrate() { synapse -P "$SUBSTRATE_PORT" --json substrate "$@" 2>&1; }
 
-trak() {
-    synapse -P "$TRAK_PORT" --json -t "$TOKEN" trak "$@" 2>&1
+# ── Resolve ──────────────────────────────────────────────────────────────────
+# Resolve a name, ID prefix, or path (hyperforge/MFORGE/schema) to a UUID.
+
+resolve_id() {
+    local input="$1"
+    local parent="${2:-}"
+
+    # Already a full UUID
+    if [[ "$input" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo "$input"
+        return
+    fi
+
+    # Path with slashes — resolve each segment
+    if [[ "$input" == */* ]]; then
+        local first="${input%%/*}"
+        local rest="${input#*/}"
+        local resolved
+        resolved=$(resolve_id "$first" "$parent")
+        [[ -z "$resolved" ]] && return
+        resolve_id "$rest" "$resolved"
+        return
+    fi
+
+    # Search in children of parent (or roots)
+    local listing
+    if [[ -n "$parent" ]]; then
+        listing=$(trak facet list --parent-id "$parent" 2>/dev/null)
+    else
+        listing=$(trak facet list 2>/dev/null)
+    fi
+
+    # Try exact title match (case-insensitive)
+    local match
+    match=$(echo "$listing" | python3 -c "
+import sys, json
+target = '${input}'.lower()
+for line in sys.stdin:
+    try:
+        obj = json.loads(line)
+        c = obj.get('content', {})
+        if c.get('type') != 'facet_summary': continue
+        title = c.get('title', '').lower()
+        fid = c.get('id', '')
+        # exact match
+        if title == target:
+            print(fid); exit()
+        # prefix match on title
+        if title.startswith(target):
+            print(fid); exit()
+        # ID prefix match
+        if fid.startswith(target):
+            print(fid); exit()
+        # contains match (fuzzy)
+        if target in title:
+            print(fid); exit()
+    except: pass
+" 2>/dev/null)
+
+    echo "$match"
 }
 
-substrate() {
-    synapse -P "$SUBSTRATE_PORT" --json substrate "$@" 2>&1
-}
+# ── Formatters ───────────────────────────────────────────────────────────────
 
-# Extract fields from JSON stream (one event per line)
-extract_facets() {
-    grep '"type":"facet_summary"' | \
+format_list() {
     python3 -c "
 import sys, json
 for line in sys.stdin:
     try:
         obj = json.loads(line)
-        c = obj.get('content', obj)
-        depth = c.get('depth', 0)
-        indent = '  ' * depth
-        children = c.get('child_count', 0)
-        child_str = f' ({children})' if children > 0 else ''
-        print(f\"{c['id'][:8]}  {indent}{c['title']}  [{c['status']}]{child_str}\")
+        c = obj.get('content', {})
+        if c.get('type') == 'facet_summary':
+            depth = c.get('depth', 0)
+            indent = '  ' * depth
+            children = c.get('child_count', 0)
+            child_str = f' ({children})' if children > 0 else ''
+            sid = c['id'][:8]
+            status = c.get('status', '?')
+            print(f'{sid}  {indent}{c[\"title\"]}  [{status}]{child_str}')
+        elif c.get('type') == 'list_summary':
+            print(f'  ({c.get(\"total\", 0)} items)')
     except: pass
 "
 }
 
-extract_detail() {
-    grep '"type":"facet_detail"\|"type":"facet_created"' | head -1 | \
+format_detail() {
     python3 -c "
 import sys, json
-line = sys.stdin.readline()
-if line:
-    obj = json.loads(line)
-    f = obj.get('content', {}).get('facet', obj.get('content', {}))
-    print(f.get('title', 'untitled'))
-    print('---')
-    print(f.get('body', '') or '(no description)')
-    print('---')
-    print(f'status: {f.get(\"status\", \"?\")}')
-    print(f'owner: {f.get(\"owner\", \"?\")}')
-    print(f'id: {f.get(\"id\", \"?\")}')
+for line in sys.stdin:
+    try:
+        obj = json.loads(line)
+        c = obj.get('content', {})
+        if c.get('type') not in ('facet_detail', 'facet_created'): continue
+        f = c.get('facet', c)
+        print(f'  {f[\"title\"]}')
+        print(f'  id:     {f[\"id\"]}')
+        print(f'  status: {f.get(\"status\", \"?\")}')
+        print(f'  owner:  {f.get(\"owner\", \"?\")}')
+        body = f.get('body', '')
+        if body:
+            print(f'')
+            for line in body.split('\n')[:20]:
+                print(f'  {line}')
+            lines = body.split('\n')
+            if len(lines) > 20:
+                print(f'  ... ({len(lines) - 20} more lines)')
+    except: pass
+"
+}
+
+format_blocked() {
+    python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        obj = json.loads(line)
+        c = obj.get('content', {})
+        if c.get('type') != 'blocked': continue
+        f = c.get('facet', {})
+        blockers = c.get('blocked_by', [])
+        bnames = ', '.join(b.get('title','?')[:30] for b in blockers)
+        print(f'{f.get(\"id\",\"\")[:8]}  {f.get(\"title\",\"?\")}')
+        print(f'          ← {bnames}')
+    except: pass
 "
 }
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
-cmd_list() {
-    local parent="${1:-}"
-    echo "── Open facets ──"
-    echo ""
-    if [[ -n "$parent" ]]; then
-        trak facet list --parent-id "$parent" | extract_facets
+cmd_ls() {
+    local target="${1:-}"
+    if [[ -z "$target" ]]; then
+        trak facet list | format_list
     else
-        trak facet list | extract_facets
+        local id
+        id=$(resolve_id "$target")
+        if [[ -z "$id" ]]; then
+            echo "Not found: $target" >&2
+            exit 1
+        fi
+        trak facet list --parent-id "$id" | format_list
     fi
-}
-
-cmd_tree() {
-    local id="${1:?usage: launch-agent.sh --tree <facet-id>}"
-    echo "── Tree ──"
-    echo ""
-    trak facet tree --id "$id" | extract_facets
-}
-
-cmd_blocked() {
-    echo "── Blocked facets ──"
-    echo ""
-    trak facet blocked | grep '"type":"blocked"' | \
-    python3 -c "
-import sys, json
-for line in sys.stdin:
-    try:
-        obj = json.loads(line)
-        c = obj.get('content', obj)
-        f = c.get('facet', {})
-        blockers = c.get('blocked_by', [])
-        blocker_names = ', '.join(b.get('title','?')[:40] for b in blockers)
-        print(f\"{f.get('id','')[:8]}  {f.get('title','?')}  ← blocked by: {blocker_names}\")
-    except: pass
-"
-}
-
-cmd_search() {
-    local query="${1:?usage: launch-agent.sh --search <query>}"
-    echo "── Search: $query ──"
-    echo ""
-    trak facet search --query "$query" | extract_facets
 }
 
 cmd_show() {
-    local id="${1:?usage: launch-agent.sh --show <facet-id>}"
-    trak facet get --id "$id" | extract_detail
+    local target="${1:?usage: launch-agent.sh show <name-or-id>}"
+    local id
+    id=$(resolve_id "$target")
+    [[ -z "$id" ]] && { echo "Not found: $target" >&2; exit 1; }
+    trak facet get --id "$id" | format_detail
 }
 
-# ── Launch ───────────────────────────────────────────────────────────────────
+cmd_tree() {
+    local target="${1:?usage: launch-agent.sh tree <name-or-id>}"
+    local id
+    id=$(resolve_id "$target")
+    [[ -z "$id" ]] && { echo "Not found: $target" >&2; exit 1; }
+    trak facet tree --id "$id" | format_list
+}
+
+cmd_search() {
+    local query="${1:?usage: launch-agent.sh search <query>}"
+    trak facet search --query "$query" | format_list
+}
+
+cmd_blocked() {
+    trak facet blocked | format_blocked
+}
+
+cmd_status() {
+    local target="${1:?usage: launch-agent.sh status <name-or-id> <status>}"
+    local new_status="${2:?usage: launch-agent.sh status <name-or-id> <status>}"
+    local id
+    id=$(resolve_id "$target")
+    [[ -z "$id" ]] && { echo "Not found: $target" >&2; exit 1; }
+    trak facet update --id "$id" --status "$new_status" | format_detail
+}
 
 cmd_launch() {
-    local facet_id="${1:?usage: launch-agent.sh <facet-id>}"
+    local target="${1:?usage: launch-agent.sh launch <name-or-id>}"
+    local id
+    id=$(resolve_id "$target")
+    [[ -z "$id" ]] && { echo "Not found: $target" >&2; exit 1; }
 
-    echo "Loading facet context..."
+    # Load facet
     local detail
-    detail=$(trak facet get --id "$facet_id" | grep '"type":"facet_detail"' | head -1)
+    detail=$(trak facet get --id "$id")
+    local title body status
+    title=$(echo "$detail" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        c = json.loads(line).get('content',{})
+        if 'facet' in c: print(c['facet']['title']); break
+    except: pass
+")
+    body=$(echo "$detail" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        c = json.loads(line).get('content',{})
+        if 'facet' in c: print(c['facet'].get('body','') or ''); break
+    except: pass
+")
+    status=$(echo "$detail" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        c = json.loads(line).get('content',{})
+        if 'facet' in c: print(c['facet'].get('status','')); break
+    except: pass
+")
 
-    if [[ -z "$detail" ]]; then
-        echo "ERROR: Facet not found: $facet_id" >&2
-        exit 1
-    fi
-
-    local title body status facet_uuid
-    title=$(echo "$detail" | python3 -c "import sys,json; c=json.loads(sys.stdin.readline())['content']; print(c['facet']['title'])")
-    body=$(echo "$detail" | python3 -c "import sys,json; c=json.loads(sys.stdin.readline())['content']; print(c['facet'].get('body','') or '')")
-    status=$(echo "$detail" | python3 -c "import sys,json; c=json.loads(sys.stdin.readline())['content']; print(c['facet']['status'])")
-    facet_uuid=$(echo "$detail" | python3 -c "import sys,json; c=json.loads(sys.stdin.readline())['content']; print(c['facet']['id'])")
-
-    # Get children (subtasks)
+    # Load children
     local children
-    children=$(trak facet list --parent-id "$facet_id" 2>/dev/null | grep '"type":"facet_summary"' | \
-        python3 -c "
+    children=$(trak facet list --parent-id "$id" 2>/dev/null | python3 -c "
 import sys, json
-items = []
 for line in sys.stdin:
     try:
-        c = json.loads(line)['content']
-        items.append(f\"- [{c['status']}] {c['title']}\")
+        c = json.loads(line).get('content',{})
+        if c.get('type') == 'facet_summary':
+            print(f'- [{c[\"status\"]}] {c[\"title\"]}')
     except: pass
-print('\n'.join(items))
 " 2>/dev/null || echo "")
 
-    # Get blockers
-    local blockers
-    blockers=$(trak facet links --id "$facet_id" 2>/dev/null | grep '"depends_on"' | \
-        python3 -c "
-import sys, json
-items = []
-for line in sys.stdin:
-    try:
-        c = json.loads(line)['content']
-        items.append(f\"- {c.get('target',{}).get('title','?')} [{c.get('target',{}).get('status','?')}]\")
-    except: pass
-print('\n'.join(items))
-" 2>/dev/null || echo "")
-
-    # Build the prompt
+    # Build prompt
     local prompt="You are working on this task:
 
 # ${title}
@@ -246,21 +297,12 @@ print('\n'.join(items))
 ${body}
 
 Status: ${status}
-Facet ID: ${facet_uuid}"
+Facet ID: ${id}"
 
-    if [[ -n "$children" ]]; then
-        prompt="${prompt}
+    [[ -n "$children" ]] && prompt="${prompt}
 
 ## Subtasks
 ${children}"
-    fi
-
-    if [[ -n "$blockers" ]]; then
-        prompt="${prompt}
-
-## Dependencies
-${blockers}"
-    fi
 
     prompt="${prompt}
 
@@ -269,122 +311,55 @@ Work on this task. When you complete subtasks, report back.
 Use the codebase at the current working directory.
 Be thorough but concise."
 
-    # Create session name from title
     local session_name
-    session_name=$(echo "$title" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | head -c 40)
+    session_name=$(echo "$title" | tr '[:upper:]' '[:lower:]' | tr ' :/' '---' | tr -cd 'a-z0-9-' | head -c 40)
 
     echo ""
-    echo "═══════════════════════════════════════════"
-    echo "  Launching agent: $title"
+    echo "  Launching: $title"
     echo "  Model: $MODEL"
     echo "  Session: $session_name"
-    echo "═══════════════════════════════════════════"
     echo ""
 
-    # Create claude code session
-    substrate claudecode create --name "$session_name" --model "$MODEL" | \
-        grep '"type"' | head -3
-
-    echo ""
-    echo "Sending prompt..."
-    echo ""
-
-    # Chat — streams tokens
+    # Create + chat
+    substrate claudecode create --name "$session_name" --model "$MODEL" >/dev/null 2>&1
     substrate claudecode chat --name "$session_name" --prompt "$prompt"
 
-    # Update facet status to in_progress
-    trak facet update --id "$facet_id" --status "in_progress" > /dev/null 2>&1 || true
-
+    # Update status
+    trak facet update --id "$id" --status "in_progress" >/dev/null 2>&1 || true
     echo ""
-    echo "═══════════════════════════════════════════"
     echo "  Session: $session_name"
-    echo "  Facet status updated to: in_progress"
-    echo "  Resume: synapse substrate claudecode chat --name $session_name --prompt '...'"
-    echo "═══════════════════════════════════════════"
-}
-
-# ── Interactive browse ───────────────────────────────────────────────────────
-
-cmd_browse() {
-    local current="${1:-}"
-
-    while true; do
-        echo ""
-        if [[ -n "$current" ]]; then
-            cmd_show "$current"
-            echo ""
-            cmd_list "$current"
-        else
-            cmd_list
-        fi
-
-        echo ""
-        echo "Commands: [id] drill in  [..] go up  [l <id>] launch  [s <query>] search  [q] quit"
-        read -rp "> " input
-
-        case "$input" in
-            q|quit|exit) break ;;
-            ..)  current="" ;;
-            s\ *) cmd_search "${input#s }" ;;
-            l\ *)
-                local launch_id="${input#l }"
-                # Expand short ID to full UUID
-                local full_id
-                full_id=$(trak facet search --query "$launch_id" | \
-                    grep '"id"' | head -1 | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-                if [[ -n "$full_id" ]]; then
-                    cmd_launch "$full_id"
-                else
-                    echo "Not found: $launch_id"
-                fi
-                ;;
-            *)
-                # Try as facet ID (expand short prefix)
-                if [[ ${#input} -eq 8 ]]; then
-                    # Short ID — search for it
-                    local matches
-                    matches=$(trak facet list ${current:+--parent-id "$current"} | \
-                        grep "\"$input" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-                    if [[ -n "$matches" ]]; then
-                        current="$matches"
-                    else
-                        echo "Not found: $input"
-                    fi
-                elif [[ ${#input} -ge 32 ]]; then
-                    current="$input"
-                else
-                    echo "Unknown command: $input"
-                fi
-                ;;
-        esac
-    done
+    echo "  Resume:  synapse substrate claudecode chat --name $session_name --prompt '...'"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-case "${1:-}" in
-    --list)     cmd_list "${2:-}" ;;
-    --tree)     cmd_tree "$2" ;;
-    --blocked)  cmd_blocked ;;
-    --search)   cmd_search "$2" ;;
-    --show)     cmd_show "$2" ;;
-    --browse)   cmd_browse "${2:-}" ;;
-    --help|-h)
-        echo "Usage:"
-        echo "  launch-agent.sh <facet-id>         Launch agent for a facet"
-        echo "  launch-agent.sh --list [parent-id]  List open facets"
-        echo "  launch-agent.sh --tree <facet-id>   Show subtree"
-        echo "  launch-agent.sh --blocked           Show blocked facets"
-        echo "  launch-agent.sh --search <query>    Search facets"
-        echo "  launch-agent.sh --show <facet-id>   Show facet detail"
-        echo "  launch-agent.sh --browse            Interactive browser"
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+    ls|list)     cmd_ls "$@" ;;
+    show)        cmd_show "$@" ;;
+    tree)        cmd_tree "$@" ;;
+    search|s)    cmd_search "$@" ;;
+    blocked)     cmd_blocked ;;
+    launch|run)  cmd_launch "$@" ;;
+    status)      cmd_status "$@" ;;
+    help|-h|--help)
+        echo "trak — browse facets, launch agents"
         echo ""
-        echo "Environment:"
-        echo "  TRAK_TOKEN        Auth token (or save to ~/.plexus/trak/token)"
-        echo "  TRAK_PORT         Trak port (default: 44107)"
-        echo "  SUBSTRATE_PORT    Substrate port (default: 4444)"
-        echo "  CLAUDE_MODEL      Model: opus, sonnet, haiku (default: sonnet)"
+        echo "  ls [name/path]           List facets (roots or children)"
+        echo "  show <name-or-id>        Show facet detail"
+        echo "  tree <name-or-id>        Show subtree"
+        echo "  search <query>           Full-text search"
+        echo "  blocked                  Show blocked facets"
+        echo "  launch <name-or-id>      Spawn Claude Code agent"
+        echo "  status <name-or-id> <s>  Update status"
+        echo ""
+        echo "Names are fuzzy-matched. Paths work: ls hyperforge/MFORGE"
+        echo "Short ID prefixes work: show 41110060"
         ;;
-    "")         cmd_browse ;;
-    *)          cmd_launch "$1" ;;
+    *)
+        # Default: treat as ls argument
+        cmd_ls "$cmd $*"
+        ;;
 esac

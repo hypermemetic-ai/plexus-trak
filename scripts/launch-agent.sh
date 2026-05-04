@@ -135,16 +135,30 @@ for line in sys.stdin:
     try:
         obj = json.loads(line)
         c = obj.get('content', {})
-        if c.get('type') == 'facet_summary':
-            depth = c.get('depth', 0)
+        t = c.get('type', '')
+        # Handle both facet_summary and search_result
+        if t in ('facet_summary', 'search_result'):
+            f = c.get('facet', c)  # search_result wraps in 'facet'
+            depth = f.get('depth', c.get('depth', 0))
             indent = '  ' * depth
-            children = c.get('child_count', 0)
+            children = f.get('child_count', c.get('child_count', 0))
             child_str = f' ({children})' if children > 0 else ''
-            sid = c['id'][:8]
-            status = c.get('status', '?')
-            print(f'{sid}  {indent}{c[\"title\"]}  [{status}]{child_str}')
-        elif c.get('type') == 'list_summary':
+            fid = f.get('id', c.get('id', '?'))[:8]
+            status = f.get('status', c.get('status', '?'))
+            title = f.get('title', c.get('title', '?'))
+            print(f'{fid}  {indent}{title}  [{status}]{child_str}')
+        elif t == 'list_summary':
             print(f'  ({c.get(\"total\", 0)} items)')
+        elif t == 'info':
+            print(f'  {c.get(\"message\", \"\")}')
+        elif t == 'error':
+            print(f'ERROR: {c.get(\"message\", \"unknown\")}', file=sys.stderr)
+    except: pass
+    # Also catch top-level errors
+    try:
+        obj = json.loads(line)
+        if obj.get('type') == 'error':
+            print(f'ERROR: {obj.get(\"message\", \"unknown\")}', file=sys.stderr)
     except: pass
 "
 }

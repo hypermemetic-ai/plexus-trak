@@ -22,18 +22,52 @@ MODEL="${CLAUDE_MODEL:-sonnet}"
 
 # ── Token ────────────────────────────────────────────────────────────────────
 
+TOKEN_FILE="${HOME}/.plexus/trak/token"
+
 resolve_token() {
+    # 1. Env var
     if [[ -n "${TRAK_TOKEN:-}" ]]; then
         echo "$TRAK_TOKEN"
         return
     fi
-    if [[ -f ~/.plexus/trak/token ]]; then
-        cat ~/.plexus/trak/token
-        return
+    # 2. Saved token file
+    if [[ -f "$TOKEN_FILE" ]]; then
+        local saved
+        saved=$(cat "$TOKEN_FILE")
+        if [[ -n "$saved" ]]; then
+            echo "$saved"
+            return
+        fi
     fi
-    echo "ERROR: No trak token. Set TRAK_TOKEN or save to ~/.plexus/trak/token" >&2
-    echo "  synapse -P $TRAK_PORT trak identity login --username <user> --password <pass>" >&2
-    exit 1
+    # 3. Interactive login
+    login_interactive
+}
+
+login_interactive() {
+    echo "No saved trak credential. Logging in..."
+    read -rp "Username: " username
+    read -rsp "Password: " password
+    echo ""
+
+    local result
+    result=$(synapse -P "$TRAK_PORT" --json trak identity login \
+        --username "$username" --password "$password" 2>&1)
+
+    local token
+    token=$(echo "$result" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    if [[ -z "$token" ]]; then
+        echo "Login failed." >&2
+        echo "$result" | grep '"message"' >&2
+        exit 1
+    fi
+
+    # Save for future use
+    mkdir -p "$(dirname "$TOKEN_FILE")"
+    echo "$token" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    echo "Token saved to $TOKEN_FILE"
+    echo "$token"
 }
 
 TOKEN=$(resolve_token)

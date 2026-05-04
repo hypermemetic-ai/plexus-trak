@@ -2,6 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::store::discuss::Comment;
 use crate::types::{Edge, Facet};
 
 /// All events emitted by trak activations.
@@ -98,10 +99,45 @@ pub enum TrakEvent {
         users: Vec<serde_json::Value>,
     },
 
-    // ── Stub domains (future) ───────────────────────────────────────
-    DiscussEvent {
-        message: String,
+    // ── SRP zero-knowledge auth ─────────────────────────────────────
+    SrpRegistered {
+        identity_id: String,
+        display_name: Option<String>,
     },
+    SrpInit {
+        session_id: String,
+        /// Hex-encoded salt.
+        salt: String,
+        /// Hex-encoded server public ephemeral (B).
+        server_public: String,
+    },
+    SrpVerified {
+        /// Hex-encoded server proof (M2). Client should verify this matches
+        /// its expected M2 to confirm the server knows the verifier.
+        server_proof: String,
+        access_token: String,
+        expires_in: u64,
+    },
+
+    // ── Discussion / comments ───────────────────────────────────────
+    CommentAdded {
+        comment: Comment,
+    },
+    CommentList {
+        comments: Vec<Comment>,
+        total: u32,
+    },
+    CommentDetail {
+        comment: Comment,
+    },
+    CommentUpdated {
+        comment: Comment,
+    },
+    CommentDeleted {
+        id: Uuid,
+    },
+
+    // ── Stub domains (future) ───────────────────────────────────────
     AuditEvent {
         message: String,
     },

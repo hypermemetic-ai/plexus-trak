@@ -181,6 +181,45 @@ impl SqliteStore {
         .execute(&self.pool)
         .await?;
 
+        // ── SRP tables ───────────────────────────────────────────────
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS srp_identities (
+                id           TEXT PRIMARY KEY,
+                display_name TEXT,
+                salt         BLOB NOT NULL,
+                verifier     BLOB NOT NULL,
+                roles        TEXT NOT NULL DEFAULT '["user"]',
+                tenant       TEXT,
+                created_at   TEXT NOT NULL,
+                last_auth_at TEXT
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS srp_sessions (
+                session_id    TEXT PRIMARY KEY,
+                identity_id   TEXT NOT NULL,
+                server_secret BLOB NOT NULL,
+                server_public BLOB NOT NULL,
+                client_public BLOB NOT NULL,
+                created_at    TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_srp_sessions_created ON srp_sessions(created_at);",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Index for parent_id lookups.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_facets_parent ON facets(parent_id);",

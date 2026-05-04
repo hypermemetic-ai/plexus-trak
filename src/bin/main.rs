@@ -12,6 +12,7 @@ use plexus_trak::hubs::collab::CollabHub;
 use plexus_trak::hubs::discuss::DiscussHub;
 use plexus_trak::hubs::identity::IdentityHub;
 use plexus_trak::hubs::refs::RefsHub;
+use plexus_trak::store::discuss::DiscussStore;
 use plexus_trak::store::identity::IdentityStore;
 use plexus_trak::store::sqlite::SqliteStore;
 use plexus_trak::auth::TrakAuth;
@@ -87,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(SqliteStore::new(&db_path).await?);
     let identity_store = IdentityStore::new(store.pool().clone());
+    let discuss_store = Arc::new(DiscussStore::new(store.pool().clone()));
+    discuss_store.migrate().await?;
 
     let trak_auth = Arc::new(TrakAuth::new(identity_store.clone(), jwt_secret.clone()));
 
@@ -94,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         DynamicHub::new("trak")
             .register(FacetHub::new(store))
             .register(IdentityHub::new(identity_store, jwt_secret))
-            .register(DiscussHub::new())
+            .register(DiscussHub::new(discuss_store))
             .register(AuditHub::new())
             .register(AccessHub::new())
             .register(CollabHub::new())

@@ -1,3 +1,4 @@
+pub mod discuss;
 pub mod identity;
 pub mod sqlite;
 

@@ -13,7 +13,9 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 
 use crate::events::TrakEvent;
-use crate::store::identity::{ApiKeyRecord, IdentityStore, RefreshTokenRecord, UserRecord};
+use crate::store::identity::{
+    ApiKeyRecord, IdentityStore, RefreshTokenRecord, SrpIdentity, SrpSession, UserRecord,
+};
 
 /// JWT claims for access tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,8 @@ pub struct Claims {
 const ACCESS_TOKEN_TTL_SECS: i64 = 3600;
 /// Refresh token TTL: 30 days.
 const REFRESH_TOKEN_TTL_SECS: i64 = 30 * 24 * 3600;
+/// SRP handshake session TTL: 5 minutes.
+const SRP_SESSION_TTL_SECS: i64 = 5 * 60;
 
 /// IdentityHub — user registration, login, JWT tokens, API keys.
 #[derive(Clone)]
@@ -57,6 +61,39 @@ impl IdentityHub {
             username: user.username.clone(),
             roles: user.roles.clone(),
             tenant: user.tenant.clone(),
+            exp: exp.timestamp() as usize,
+            iat: now.timestamp() as usize,
+        };
+
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(&self.jwt_secret),
+        )
+        .map_err(|e| format!("JWT encode error: {e}"))?;
+
+        Ok((token, ACCESS_TOKEN_TTL_SECS as u64))
+    }
+
+    /// Issue a JWT for an SRP identity. Uses the same `Claims` shape as
+    /// password-based login so `TrakAuth::try_jwt` accepts both transparently.
+    fn issue_srp_access_token(&self, identity: &SrpIdentity) -> Result<(String, u64), String> {
+        let now = Utc::now();
+        let exp = now + Duration::seconds(ACCESS_TOKEN_TTL_SECS);
+
+        // JWT validation requires a `username` claim — fall back to a stable
+        // synthetic when SRP identity has no display name.
+        let username = identity.display_name.clone().unwrap_or_else(|| {
+            let short = identity.id.simple().to_string();
+            let short = &short[..short.len().min(8)];
+            format!("srp:{short}")
+        });
+
+        let claims = Claims {
+            sub: identity.id.to_string(),
+            username,
+            roles: identity.roles.clone(),
+            tenant: identity.tenant.clone(),
             exp: exp.timestamp() as usize,
             iat: now.timestamp() as usize,
         };
@@ -506,6 +543,311 @@ impl IdentityHub {
                     message: e.to_string(),
                 },
             }
+        }
+    }
+
+    /// Register a new SRP identity (zero-knowledge auth).
+    #[plexus_macros::method(
+        description = "Register a new SRP identity. Client computes salt + verifier locally; the server never sees a password.",
+        params(
+            salt = "Hex-encoded salt (16 bytes recommended, client-generated)",
+            verifier = "Hex-encoded verifier from g^x mod N where x = H(salt, password)",
+            display_name = "Optional human-readable name",
+            tenant = "Optional tenant for isolation"
+        )
+    )]
+    async fn srp_register(
+        &self,
+        salt: String,
+        verifier: String,
+        display_name: Option<String>,
+        tenant: Option<String>,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let store = self.store.clone();
+        stream! {
+            let salt_bytes = match hex::decode(&salt) {
+                Ok(b) => b,
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("bad_salt".into()),
+                        message: format!("salt is not valid hex: {e}"),
+                    };
+                    return;
+                }
+            };
+            let verifier_bytes = match hex::decode(&verifier) {
+                Ok(b) => b,
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("bad_verifier".into()),
+                        message: format!("verifier is not valid hex: {e}"),
+                    };
+                    return;
+                }
+            };
+
+            let identity = SrpIdentity {
+                id: uuid::Uuid::new_v4(),
+                display_name: display_name.clone(),
+                salt: salt_bytes,
+                verifier: verifier_bytes,
+                roles: vec!["user".into()],
+                tenant,
+                created_at: Utc::now(),
+                last_auth_at: None,
+            };
+
+            match store.create_srp_identity(&identity).await {
+                Ok(()) => yield TrakEvent::SrpRegistered {
+                    identity_id: identity.id.to_string(),
+                    display_name,
+                },
+                Err(e) => yield TrakEvent::Error {
+                    code: Some("srp_register_failed".into()),
+                    message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    /// Begin SRP handshake. Server generates ephemeral keypair, returns
+    /// salt + server public ephemeral (B). Client uses these to derive its
+    /// proof in `srp_verify`.
+    #[plexus_macros::method(
+        description = "Begin SRP handshake. Server returns salt and server public ephemeral (B).",
+        params(
+            identity_id = "UUID returned from srp_register",
+            client_public = "Hex-encoded A value from client's ephemeral keypair"
+        )
+    )]
+    async fn srp_init(
+        &self,
+        identity_id: String,
+        client_public: String,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let store = self.store.clone();
+        stream! {
+            // Best-effort cleanup of stale sessions.
+            let _ = store.cleanup_expired_srp_sessions(SRP_SESSION_TTL_SECS).await;
+
+            let identity_uuid = match uuid::Uuid::parse_str(&identity_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("bad_identity_id".into()),
+                        message: format!("invalid identity UUID: {e}"),
+                    };
+                    return;
+                }
+            };
+
+            let client_pub_bytes = match hex::decode(&client_public) {
+                Ok(b) => b,
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("bad_client_public".into()),
+                        message: format!("client_public is not valid hex: {e}"),
+                    };
+                    return;
+                }
+            };
+
+            let identity = match store.get_srp_identity(identity_uuid).await {
+                Ok(Some(i)) => i,
+                Ok(None) => {
+                    yield TrakEvent::Error {
+                        code: Some("srp_identity_not_found".into()),
+                        message: format!("SRP identity {identity_id} not found"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("srp_lookup_failed".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+
+            // Generate server ephemeral private value `b` (32 random bytes).
+            let mut b_bytes = [0u8; 32];
+            {
+                use rand::RngCore;
+                rand::rngs::OsRng.fill_bytes(&mut b_bytes);
+            }
+
+            // Compute server public ephemeral B from b and verifier.
+            let server = srp::server::SrpServer::<Sha256>::new(&srp::groups::G_4096);
+            let b_pub = server.compute_public_ephemeral(&b_bytes, &identity.verifier);
+
+            // Generate session ID.
+            let mut sid_bytes = [0u8; 16];
+            {
+                use rand::RngCore;
+                rand::rngs::OsRng.fill_bytes(&mut sid_bytes);
+            }
+            let session_id = hex::encode(sid_bytes);
+
+            let session = SrpSession {
+                session_id: session_id.clone(),
+                identity_id: identity.id,
+                server_secret: b_bytes.to_vec(),
+                server_public: b_pub.clone(),
+                client_public: client_pub_bytes,
+                created_at: Utc::now(),
+            };
+
+            if let Err(e) = store.create_srp_session(&session).await {
+                yield TrakEvent::Error {
+                    code: Some("srp_session_create_failed".into()),
+                    message: e.to_string(),
+                };
+                return;
+            }
+
+            yield TrakEvent::SrpInit {
+                session_id,
+                salt: hex::encode(&identity.salt),
+                server_public: hex::encode(&b_pub),
+            };
+        }
+    }
+
+    /// Complete SRP handshake. Verifies the client's proof (M1), returns
+    /// the server's proof (M2) plus a JWT access token. Session is
+    /// single-use and deleted on success or failure.
+    #[plexus_macros::method(
+        description = "Complete SRP handshake. Returns server proof (M2) + JWT on success.",
+        params(
+            session_id = "Session ID returned from srp_init",
+            client_proof = "Hex-encoded M1 from client"
+        )
+    )]
+    async fn srp_verify(
+        &self,
+        session_id: String,
+        client_proof: String,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let store = self.store.clone();
+        let self_clone = self.clone();
+        stream! {
+            // Best-effort cleanup of stale sessions.
+            let _ = store.cleanup_expired_srp_sessions(SRP_SESSION_TTL_SECS).await;
+
+            let proof_bytes = match hex::decode(&client_proof) {
+                Ok(b) => b,
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("bad_client_proof".into()),
+                        message: format!("client_proof is not valid hex: {e}"),
+                    };
+                    return;
+                }
+            };
+
+            let session = match store.get_srp_session(&session_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    yield TrakEvent::Error {
+                        code: Some("srp_session_not_found".into()),
+                        message: "SRP session not found or already used".into(),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("srp_session_lookup_failed".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+
+            // Enforce TTL.
+            let age = (Utc::now() - session.created_at).num_seconds();
+            if age > SRP_SESSION_TTL_SECS {
+                let _ = store.delete_srp_session(&session_id).await;
+                yield TrakEvent::Error {
+                    code: Some("srp_session_expired".into()),
+                    message: "SRP session expired (5 minute TTL)".into(),
+                };
+                return;
+            }
+
+            let identity = match store.get_srp_identity(session.identity_id).await {
+                Ok(Some(i)) => i,
+                Ok(None) => {
+                    let _ = store.delete_srp_session(&session_id).await;
+                    yield TrakEvent::Error {
+                        code: Some("srp_identity_not_found".into()),
+                        message: "SRP identity backing session no longer exists".into(),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield TrakEvent::Error {
+                        code: Some("srp_lookup_failed".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+
+            // Reconstruct server-side verifier state from stored b, v, A.
+            let server = srp::server::SrpServer::<Sha256>::new(&srp::groups::G_4096);
+            let server_verifier = match server.process_reply(
+                &session.server_secret,
+                &identity.verifier,
+                &session.client_public,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = store.delete_srp_session(&session_id).await;
+                    yield TrakEvent::Error {
+                        code: Some("srp_process_failed".into()),
+                        message: format!("server failed to process reply: {e:?}"),
+                    };
+                    return;
+                }
+            };
+
+            // Verify M1.
+            if let Err(e) = server_verifier.verify_client(&proof_bytes) {
+                let _ = store.delete_srp_session(&session_id).await;
+                yield TrakEvent::Error {
+                    code: Some("srp_proof_invalid".into()),
+                    message: format!("client proof rejected: {e:?}"),
+                };
+                return;
+            }
+
+            // Issue JWT bound to the SRP identity UUID.
+            let (access_token, expires_in) = match self_clone.issue_srp_access_token(&identity) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = store.delete_srp_session(&session_id).await;
+                    yield TrakEvent::Error {
+                        code: Some("token_error".into()),
+                        message: e,
+                    };
+                    return;
+                }
+            };
+
+            // M2 for client to verify the server.
+            let server_proof = hex::encode(server_verifier.proof());
+
+            // Single-use: drop the session.
+            let _ = store.delete_srp_session(&session_id).await;
+            // Touch last_auth_at (best effort).
+            let _ = store.touch_srp_identity(identity.id).await;
+
+            yield TrakEvent::SrpVerified {
+                server_proof,
+                access_token,
+                expires_in,
+            };
         }
     }
 }

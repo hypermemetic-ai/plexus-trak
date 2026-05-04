@@ -115,6 +115,28 @@ pub enum TrakEvent {
         message: String,
     },
 
+    // ── Checkout / diff / flush ─────────────────────────────────────
+    CheckoutComplete {
+        root_id: Uuid,
+        file_count: u32,
+        base_path: String,
+    },
+    DiffEntryEvent {
+        kind: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<Uuid>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    FlushReport {
+        created: u32,
+        modified: u32,
+        deleted: u32,
+        moved: u32,
+        conflicts: u32,
+    },
+
     // ── Meta ────────────────────────────────────────────────────────
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]

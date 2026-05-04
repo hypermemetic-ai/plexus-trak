@@ -606,6 +606,132 @@ impl FacetHub {
         }
     }
 
+    /// Check out a facet subtree to disk as markdown files
+    #[plexus_macros::method(
+        description = "Write facet subtree to disk as markdown for editing",
+        params(
+            id = "Root facet UUID",
+            path = "Working directory path (will be created)"
+        )
+    )]
+    async fn checkout(
+        &self,
+        auth: &AuthContext,
+        id: String,
+        path: String,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let _ = auth;
+        let store = self.store.clone();
+        stream! {
+            let root = match uuid::Uuid::parse_str(&id) {
+                Ok(u) => u,
+                Err(e) => {
+                    yield TrakEvent::Error { code: Some("invalid_id".into()), message: e.to_string() };
+                    return;
+                }
+            };
+            let base = std::path::Path::new(&path);
+            match crate::checkout::checkout(store.as_ref(), root, base).await {
+                Ok(manifest) => {
+                    let count = manifest.facets.len() as u32;
+                    yield TrakEvent::CheckoutComplete {
+                        root_id: root,
+                        file_count: count,
+                        base_path: path,
+                    };
+                }
+                Err(e) => {
+                    yield TrakEvent::Error { code: Some("checkout_failed".into()), message: e.to_string() };
+                }
+            }
+        }
+    }
+
+    /// Show pending changes between disk and trak
+    #[plexus_macros::method(
+        description = "Show diff between checked-out files and trak state",
+        params(path = "Working directory path")
+    )]
+    async fn diff(
+        &self,
+        auth: &AuthContext,
+        path: String,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let _ = auth;
+        let store = self.store.clone();
+        stream! {
+            let base = std::path::Path::new(&path);
+            match crate::checkout::diff(store.as_ref(), base).await {
+                Ok(entries) => {
+                    let count = entries.len();
+                    for entry in entries {
+                        let detail = match &entry {
+                            crate::checkout::DiffEntry::Conflict { reason, .. } => Some(reason.clone()),
+                            crate::checkout::DiffEntry::Moved { old_path, new_path, .. } => {
+                                Some(format!("{old_path} -> {new_path}"))
+                            }
+                            _ => None,
+                        };
+                        yield TrakEvent::DiffEntryEvent {
+                            kind: entry.kind().to_string(),
+                            path: entry.path().to_string(),
+                            uuid: entry.uuid(),
+                            detail,
+                        };
+                    }
+                    yield TrakEvent::Info { message: format!("{count} change(s)") };
+                }
+                Err(e) => {
+                    yield TrakEvent::Error { code: Some("diff_failed".into()), message: e.to_string() };
+                }
+            }
+        }
+    }
+
+    /// Apply changes from disk back into trak
+    #[plexus_macros::method(
+        description = "Sync local file changes back into trak",
+        params(
+            path = "Working directory path",
+            force = "Apply changes even if conflicts detected (default: false)"
+        )
+    )]
+    async fn flush(
+        &self,
+        auth: &AuthContext,
+        path: String,
+        force: Option<bool>,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let store = self.store.clone();
+        let owner = owner_from_auth(auth);
+        let force = force.unwrap_or(false);
+        stream! {
+            let base = std::path::Path::new(&path);
+            match crate::checkout::flush(store.as_ref(), base, &owner, force).await {
+                Ok(report) => {
+                    yield TrakEvent::FlushReport {
+                        created: report.created,
+                        modified: report.modified,
+                        deleted: report.deleted,
+                        moved: report.moved,
+                        conflicts: report.conflicts.len() as u32,
+                    };
+                    for c in report.conflicts {
+                        yield TrakEvent::DiffEntryEvent {
+                            kind: c.kind,
+                            path: c.path,
+                            uuid: c.uuid,
+                            detail: c.detail,
+                        };
+                    }
+                }
+                Err(e) => {
+                    yield TrakEvent::Error { code: Some("flush_failed".into()), message: e.to_string() };
+                }
+            }
+        }
+    }
+
     /// Import plan epics from a workspace directory into trak facets.
     ///
     /// Scans for `plans/` directories across all repos in the workspace,

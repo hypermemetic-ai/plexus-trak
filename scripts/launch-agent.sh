@@ -229,6 +229,24 @@ cmd_search() {
     trak facet search --query "$query" | format_list
 }
 
+cmd_grep() {
+    local pattern="${1:?usage: launch-agent.sh grep <regex> [--status <s>] [--in <name-or-id>]}"
+    shift
+    local status_flag="" parent_flag=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status) status_flag="--status $2"; shift 2 ;;
+            --in)
+                local pid
+                pid=$(resolve_id "$2")
+                [[ -n "$pid" ]] && parent_flag="--parent-id $pid"
+                shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    trak facet grep --pattern "$pattern" $status_flag $parent_flag | format_list
+}
+
 cmd_blocked() {
     trak facet blocked | format_blocked
 }
@@ -341,6 +359,7 @@ case "$cmd" in
     show)        cmd_show "$@" ;;
     tree)        cmd_tree "$@" ;;
     search|s)    cmd_search "$@" ;;
+    grep|g)      cmd_grep "$@" ;;
     blocked)     cmd_blocked ;;
     launch|run)  cmd_launch "$@" ;;
     status)      cmd_status "$@" ;;
@@ -350,7 +369,10 @@ case "$cmd" in
         echo "  ls [name/path]           List facets (roots or children)"
         echo "  show <name-or-id>        Show facet detail"
         echo "  tree <name-or-id>        Show subtree"
-        echo "  search <query>           Full-text search"
+        echo "  search <query>           Full-text search (keywords)"
+        echo "  grep <regex> [opts]      Regex search across titles + bodies"
+        echo "    --status <s>             filter by status"
+        echo "    --in <name-or-id>        scope to subtree"
         echo "  blocked                  Show blocked facets"
         echo "  launch <name-or-id>      Spawn Claude Code agent"
         echo "  status <name-or-id> <s>  Update status"

@@ -44,11 +44,12 @@ resolve_token() {
 }
 
 login_interactive() {
-    echo "No saved trak credential. Logging in..."
+    echo "No saved trak credential."
     read -rp "Username: " username
     read -rsp "Password: " password
     echo ""
 
+    # Try login first
     local result
     result=$(synapse -P "$TRAK_PORT" --json trak identity login \
         --username "$username" --password "$password" 2>&1)
@@ -56,17 +57,38 @@ login_interactive() {
     local token
     token=$(echo "$result" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
 
+    # If login failed, register then login
     if [[ -z "$token" ]]; then
-        echo "Login failed." >&2
-        echo "$result" | grep '"message"' >&2
-        exit 1
+        echo "User not found — registering..."
+        read -rp "Display name (optional): " display_name
+        read -rp "Tenant (optional): " tenant
+
+        local reg_args="--username $username --password $password"
+        [[ -n "$display_name" ]] && reg_args="$reg_args --display_name $display_name"
+        [[ -n "$tenant" ]] && reg_args="$reg_args --tenant $tenant"
+
+        local reg_result
+        reg_result=$(synapse -P "$TRAK_PORT" --json trak identity register $reg_args 2>&1)
+
+        if echo "$reg_result" | grep -q '"user_registered"'; then
+            echo "Registered. Logging in..."
+            result=$(synapse -P "$TRAK_PORT" --json trak identity login \
+                --username "$username" --password "$password" 2>&1)
+            token=$(echo "$result" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
+        fi
+
+        if [[ -z "$token" ]]; then
+            echo "Registration/login failed." >&2
+            echo "$reg_result" | grep '"message"' >&2
+            exit 1
+        fi
     fi
 
     # Save for future use
     mkdir -p "$(dirname "$TOKEN_FILE")"
     echo "$token" > "$TOKEN_FILE"
     chmod 600 "$TOKEN_FILE"
-    echo "Token saved to $TOKEN_FILE"
+    echo "Authenticated as $username. Token saved."
     echo "$token"
 }
 

@@ -6,7 +6,66 @@ use plexus_core::plexus::AuthContext;
 
 use crate::events::TrakEvent;
 use crate::store::{Direction, FacetStore, StoreError};
-use crate::types::{Edge, EdgeKind, Facet, FacetMeta};
+use crate::types::{Edge, EdgeKind, Facet, FacetUpdate, NewFacet};
+
+/// Post-filter a slice of facets by tag/priority criteria.
+///
+/// Filtering is in-memory after the store query because:
+/// 1. Tags live in a JSON column (`meta_json`), not a normalized table.
+///    SQLite JSON1 (`json_extract(meta_json, '$.tags')`) would work but
+///    requires per-call SQL composition; the per-row deserialize cost is
+///    already paid by `row_to_facet`, so post-filter is O(n) over the
+///    already-loaded set.
+/// 2. The acceptance criterion targets a 1000-facet dataset under 100ms;
+///    in-memory filter on a Vec<Facet> easily clears that.
+///
+/// Semantics (from TRAK-API-3):
+/// - `tags_any` non-empty → keep facets whose meta.tags overlaps (OR).
+/// - `tags_all` non-empty → keep facets whose meta.tags is a superset (AND).
+/// - `priority` non-empty → keep facets whose meta.priority ∈ values.
+/// - All three combine with AND across categories.
+/// - Any empty/None filter is a no-op.
+pub fn filter_facets(
+    facets: Vec<Facet>,
+    tags_any: Option<&[String]>,
+    tags_all: Option<&[String]>,
+    priority: Option<&[String]>,
+) -> Vec<Facet> {
+    let tags_any = tags_any.filter(|t| !t.is_empty());
+    let tags_all = tags_all.filter(|t| !t.is_empty());
+    let priority = priority.filter(|p| !p.is_empty());
+
+    if tags_any.is_none() && tags_all.is_none() && priority.is_none() {
+        return facets;
+    }
+
+    facets
+        .into_iter()
+        .filter(|f| {
+            let facet_tags: &[String] = f.meta.tags.as_deref().unwrap_or(&[]);
+
+            if let Some(any) = tags_any {
+                // OR semantics: at least one of `any` is in facet_tags.
+                if !any.iter().any(|t| facet_tags.contains(t)) {
+                    return false;
+                }
+            }
+            if let Some(all) = tags_all {
+                // AND semantics: every tag in `all` is in facet_tags.
+                if !all.iter().all(|t| facet_tags.contains(t)) {
+                    return false;
+                }
+            }
+            if let Some(prios) = priority {
+                match &f.meta.priority {
+                    Some(p) if prios.iter().any(|x| x == p) => {}
+                    _ => return false,
+                }
+            }
+            true
+        })
+        .collect()
+}
 
 /// FacetHub — core CRUD + tree + link operations on facets.
 #[derive(Clone)]
@@ -39,13 +98,24 @@ fn tenant_from_auth(auth: &AuthContext) -> Option<String> {
 )]
 impl FacetHub {
     /// Create a new facet
+    ///
+    /// Wire-level params remain flat for backward compat (--title, --body,
+    /// --parent-id, --status). New optional params (--tags, --priority,
+    /// --meta-extra) flow through to the matching `NewFacet` fields. The
+    /// activation builds a `NewFacet` internally and materializes a `Facet`
+    /// via `NewFacet::into_facet`. This is the "fallback" path described in
+    /// TRAK-API-2 risks — it satisfies the ticket contract while keeping CLI
+    /// callers unchanged.
     #[plexus_macros::method(
         description = "Create a new facet (task / epic / note / anything). If authenticated, sets owner from auth context.",
         params(
-            title = "Facet title",
+            title = "Facet title (required, non-empty)",
             body = "Optional body / description",
             parent_id = "Parent facet UUID (omit for root)",
-            status = "Initial status (default: open)"
+            status = "Initial status (default: open)",
+            tags = "Optional list of tags",
+            priority = "Optional priority string (e.g. low, medium, high, critical)",
+            meta_extra = "Optional JSON object merged into facet.meta extensible bag"
         )
     )]
     async fn create(
@@ -55,6 +125,9 @@ impl FacetHub {
         body: Option<String>,
         parent_id: Option<String>,
         status: Option<String>,
+        tags: Option<Vec<String>>,
+        priority: Option<String>,
+        meta_extra: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
         let store = self.store.clone();
         let owner = owner_from_auth(auth);
@@ -67,22 +140,20 @@ impl FacetHub {
                     return;
                 }
             };
-            let now = chrono::Utc::now();
-            let mut meta = FacetMeta::default();
-            if let Some(t) = tenant {
-                meta.extra.insert("tenant".into(), serde_json::Value::String(t));
-            }
-            let facet = Facet {
-                id: uuid::Uuid::new_v4(),
-                parent_id: parent_uuid,
+            let new_facet = NewFacet {
                 title,
                 body,
-                status: status.unwrap_or_else(|| "open".into()),
-                owner,
-                meta,
-                created_at: now,
-                updated_at: now,
+                parent_id: parent_uuid,
+                status,
+                tags,
+                priority,
+                meta_extra,
             };
+            if let Err(e) = new_facet.validate() {
+                yield TrakEvent::Error { code: Some("invalid_input".into()), message: e };
+                return;
+            }
+            let facet = new_facet.into_facet(owner, tenant);
             match store.create_facet(&facet).await {
                 Ok(()) => yield TrakEvent::FacetCreated { facet },
                 Err(e) => yield TrakEvent::Error { code: Some("create_failed".into()), message: e.to_string() },
@@ -114,13 +185,21 @@ impl FacetHub {
     }
 
     /// Update a facet
+    ///
+    /// Wire-level params remain flat; activation builds a `FacetUpdate`
+    /// internally and applies it via `FacetUpdate::apply` so all merge
+    /// semantics (tags replace; meta_extra shallow-merge with null-deletes)
+    /// live in one tested place.
     #[plexus_macros::method(
-        description = "Update a facet's title, body, or status",
+        description = "Update a facet. Omit a field to leave it unchanged. tags=[] clears tags; meta_extra is shallow-merged (null value deletes a key).",
         params(
             id = "Facet UUID",
             title = "New title (optional)",
             body = "New body (optional)",
-            status = "New status (optional)"
+            status = "New status (optional)",
+            tags = "Replace tags entirely. [] clears tags. Omit to leave unchanged.",
+            priority = "Replace priority. Omit to leave unchanged.",
+            meta_extra = "Shallow-merge into meta extensible bag. null value deletes a key."
         )
     )]
     async fn update(
@@ -129,6 +208,9 @@ impl FacetHub {
         title: Option<String>,
         body: Option<String>,
         status: Option<String>,
+        tags: Option<Vec<String>>,
+        priority: Option<String>,
+        meta_extra: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
         let store = self.store.clone();
         stream! {
@@ -150,9 +232,21 @@ impl FacetHub {
                     return;
                 }
             };
-            if let Some(t) = title { facet.title = t; }
-            if let Some(b) = body { facet.body = Some(b); }
-            if let Some(s) = status { facet.status = s; }
+            let update = FacetUpdate {
+                title,
+                body,
+                status,
+                tags,
+                priority,
+                meta_extra,
+            };
+            // Apply the update (in-place). Even if no fields changed we still
+            // bump updated_at and persist for symmetry with the prior behavior
+            // (which always wrote regardless of change).
+            update.apply(&mut facet);
+            // Match prior behavior: always bump updated_at on update calls,
+            // even if every field was None (no observable change). This keeps
+            // the existing test_update_status invariant.
             facet.updated_at = chrono::Utc::now();
 
             match store.update_facet(&facet).await {
@@ -234,13 +328,25 @@ impl FacetHub {
     }
 
     /// List facets (children of a parent, or roots)
+    ///
+    /// Optional `tags`, `tags_all`, `priority` filters (TRAK-API-3) post-filter
+    /// the result set. Empty arrays / None mean "no filter" — default behavior
+    /// is byte-for-byte identical to the prior implementation.
     #[plexus_macros::method(
-        description = "List child facets under a parent, or list roots",
-        params(parent_id = "Parent UUID (omit for roots)")
+        description = "List child facets under a parent (or roots). Optionally filter by tags / priority.",
+        params(
+            parent_id = "Parent UUID (omit for roots)",
+            tags = "OR filter: keep facets whose tags include any of these",
+            tags_all = "AND filter: keep facets whose tags include all of these",
+            priority = "Keep facets whose priority is one of these"
+        )
     )]
     async fn list(
         &self,
         parent_id: Option<String>,
+        tags: Option<Vec<String>>,
+        tags_all: Option<Vec<String>>,
+        priority: Option<Vec<String>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
         let store = self.store.clone();
         stream! {
@@ -253,6 +359,7 @@ impl FacetHub {
             };
             match store.list_children(parent_uuid).await {
                 Ok(facets) => {
+                    let facets = filter_facets(facets, tags.as_deref(), tags_all.as_deref(), priority.as_deref());
                     let total = facets.len() as u32;
                     for facet in facets {
                         let child_count = store.count_children(Some(facet.id)).await.unwrap_or(0);
@@ -499,16 +606,43 @@ impl FacetHub {
     }
 
     /// Full-text search across facets
+    ///
+    /// Optional tag/priority filters post-filter FTS5 results. FTS5 ranking
+    /// order is unchanged when no filters apply (the filter is a stable
+    /// retain over the already-sorted result vec).
     #[plexus_macros::method(
-        description = "Full-text search across facet titles and bodies",
-        params(query = "Search query (FTS5 syntax)")
+        description = "Full-text search across facet titles and bodies. Optionally filter by tags / priority.",
+        params(
+            query = "Search query (FTS5 syntax)",
+            tags = "OR filter: keep facets whose tags include any of these",
+            tags_all = "AND filter: keep facets whose tags include all of these",
+            priority = "Keep facets whose priority is one of these"
+        )
     )]
-    async fn search(&self, query: String) -> impl Stream<Item = TrakEvent> + Send + 'static {
+    async fn search(
+        &self,
+        query: String,
+        tags: Option<Vec<String>>,
+        tags_all: Option<Vec<String>>,
+        priority: Option<Vec<String>>,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
         let store = self.store.clone();
         stream! {
             match store.search(&query).await {
                 Ok(results) => {
+                    let tags_any = tags.as_deref().filter(|t| !t.is_empty());
+                    let tags_all = tags_all.as_deref().filter(|t| !t.is_empty());
+                    let priority = priority.as_deref().filter(|p| !p.is_empty());
+                    let no_filter = tags_any.is_none() && tags_all.is_none() && priority.is_none();
                     for (facet, score) in results {
+                        if !no_filter {
+                            // Wrap the single facet so we can reuse the shared
+                            // filter logic and keep the matrix tested in one place.
+                            let kept = filter_facets(vec![facet.clone()], tags_any, tags_all, priority);
+                            if kept.is_empty() {
+                                continue;
+                            }
+                        }
                         yield TrakEvent::SearchResult { facet, score: Some(score) };
                     }
                 }
@@ -523,7 +657,10 @@ impl FacetHub {
         params(
             pattern = "Regex pattern (Rust regex syntax)",
             status = "Filter by status (optional)",
-            parent_id = "Scope to children of this facet (optional)"
+            parent_id = "Scope to children of this facet (optional)",
+            tags = "OR filter: keep facets whose tags include any of these",
+            tags_all = "AND filter: keep facets whose tags include all of these",
+            priority = "Keep facets whose priority is one of these"
         )
     )]
     async fn grep(
@@ -531,6 +668,9 @@ impl FacetHub {
         pattern: String,
         status: Option<String>,
         parent_id: Option<String>,
+        tags: Option<Vec<String>>,
+        tags_all: Option<Vec<String>>,
+        priority: Option<Vec<String>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
         let store = self.store.clone();
         stream! {
@@ -582,6 +722,11 @@ impl FacetHub {
                     }
                 }
             };
+
+            // Apply tag/priority filters before regex (cheap reject of irrelevant
+            // facets first; preserves doc order so the output sequence matches
+            // prior behavior when no tag/priority filters are provided).
+            let facets = filter_facets(facets, tags.as_deref(), tags_all.as_deref(), priority.as_deref());
 
             let mut count = 0u32;
             for facet in &facets {

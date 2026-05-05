@@ -10,6 +10,7 @@ pub mod types;
 pub use auth::TrakAuth;
 pub use events::TrakEvent;
 pub use hubs::discuss::DiscussHub;
+pub use hubs::docs::DocsHub;
 pub use hubs::facet::FacetHub;
 pub use hubs::identity::IdentityHub;
 pub use store::FacetStore;

@@ -173,6 +173,23 @@ pub enum TrakEvent {
         conflicts: u32,
     },
 
+    // ── Docs ────────────────────────────────────────────────────────
+    DocsAbout {
+        name: String,
+        version: String,
+        description: String,
+        hubs: Vec<String>,
+    },
+    DocsGuide {
+        id: String,
+        slug: String,
+        title: String,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    },
+
     // ── Meta ────────────────────────────────────────────────────────
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]

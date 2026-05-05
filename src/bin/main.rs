@@ -10,6 +10,7 @@ use plexus_trak::hubs::access::AccessHub;
 use plexus_trak::hubs::audit::AuditHub;
 use plexus_trak::hubs::collab::CollabHub;
 use plexus_trak::hubs::discuss::DiscussHub;
+use plexus_trak::hubs::docs::DocsHub;
 use plexus_trak::hubs::identity::IdentityHub;
 use plexus_trak::hubs::refs::RefsHub;
 use plexus_trak::store::discuss::DiscussStore;
@@ -95,9 +96,10 @@ async fn main() -> anyhow::Result<()> {
 
     let hub = Arc::new(
         DynamicHub::new("trak")
-            .register(FacetHub::new(store))
+            .register(FacetHub::new(store.clone()))
             .register(IdentityHub::new(identity_store, jwt_secret))
             .register(DiscussHub::new(discuss_store))
+            .register(DocsHub::new(store))
             .register(AuditHub::new())
             .register(AccessHub::new())
             .register(CollabHub::new())

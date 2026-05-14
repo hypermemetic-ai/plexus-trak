@@ -5,6 +5,7 @@ pub mod hubs;
 pub mod import;
 pub mod index;
 pub mod store;
+pub mod tenant_gate;
 pub mod types;
 
 pub use auth::TrakAuth;

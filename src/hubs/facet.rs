@@ -6,6 +6,7 @@ use plexus_core::plexus::AuthContext;
 
 use crate::events::TrakEvent;
 use crate::store::{Direction, FacetStore, StoreError};
+use crate::tenant_gate::{GateError, TenantGate};
 use crate::types::{Edge, EdgeKind, Facet, FacetUpdate, NewFacet};
 
 /// Post-filter a slice of facets by tag/priority criteria.
@@ -129,8 +130,16 @@ impl FacetHub {
         priority: Option<String>,
         meta_extra: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        // Build the tenant gate up front (the resolver is async, and the
+        // returned stream is 'static so it can't borrow `auth`). The gate
+        // owns its `Tenant` value; the stream captures the gate by move.
+        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
         let owner = owner_from_auth(auth);
+        // For the seed `tenant` carried by NewFacet::into_facet we still
+        // pass the AuthContext-derived value — but the gate's `create` will
+        // override `meta.extra["tenant"]` to the resolved tenant before
+        // writing. The "tenant" string here is therefore advisory; the
+        // structural truth lives in the gate.
         let tenant = tenant_from_auth(auth);
         stream! {
             let parent_uuid = match parent_id.as_deref().map(uuid::Uuid::parse_str).transpose() {
@@ -154,20 +163,38 @@ impl FacetHub {
                 return;
             }
             let facet = new_facet.into_facet(owner, tenant);
-            match store.create_facet(&facet).await {
-                Ok(()) => yield TrakEvent::FacetCreated { facet },
+            match gate.create(facet).await {
+                Ok(facet) => yield TrakEvent::FacetCreated { facet },
+                Err(GateError::Unauthenticated) => yield TrakEvent::Error {
+                    code: Some("unauthenticated".into()),
+                    message: "create requires an authenticated tenant".into(),
+                },
                 Err(e) => yield TrakEvent::Error { code: Some("create_failed".into()), message: e.to_string() },
             }
         }
     }
 
     /// Get a facet by ID
+    ///
+    /// **AUTHZ-TENANT-GATE note:** routed through `TenantGate::get`, which
+    /// returns `NotFound` for both "does not exist" and "exists but in
+    /// foreign tenant". The conflation is intentional (existence-oracle
+    /// defense). Ideally this handler would accept `auth: Option<&AuthContext>`
+    /// so anonymous callers could still read public facets; the
+    /// `plexus-macros::method` codegen unwraps `Option<&AuthContext>` to
+    /// `&AuthContext` regardless of the declared shape (see RUN-NOTES under
+    /// "macro doesn't support optional auth"). Until that is fixed,
+    /// `get` is forced-auth here.
     #[plexus_macros::method(
-        description = "Retrieve a single facet by UUID",
+        description = "Retrieve a single facet by UUID (visibility scoped to caller's tenant)",
         params(id = "Facet UUID")
     )]
-    async fn get(&self, id: String) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+    async fn get(
+        &self,
+        auth: &AuthContext,
+        id: String,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
         stream! {
             let uuid = match uuid::Uuid::parse_str(&id) {
                 Ok(u) => u,
@@ -176,9 +203,9 @@ impl FacetHub {
                     return;
                 }
             };
-            match store.get_facet(uuid).await {
+            match gate.get(uuid).await {
                 Ok(facet) => yield TrakEvent::FacetDetail { facet },
-                Err(StoreError::NotFound(_)) => yield TrakEvent::Error { code: Some("not_found".into()), message: format!("facet {id} not found") },
+                Err(GateError::NotFound) => yield TrakEvent::Error { code: Some("not_found".into()), message: format!("facet {id} not found") },
                 Err(e) => yield TrakEvent::Error { code: Some("get_failed".into()), message: e.to_string() },
             }
         }
@@ -204,6 +231,7 @@ impl FacetHub {
     )]
     async fn update(
         &self,
+        auth: &AuthContext,
         id: String,
         title: Option<String>,
         body: Option<String>,
@@ -212,7 +240,14 @@ impl FacetHub {
         priority: Option<String>,
         meta_extra: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        // AUTHZ-TENANT-GATE: this handler now requires auth (previously
+        // anonymous-writable — a privilege escalation vector). Routed
+        // through `TenantGate::update`, which:
+        //   - returns NotFound for missing target,
+        //   - returns Forbidden for cross-tenant write,
+        //   - preserves the existing meta.extra["tenant"] (no hopping).
+        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
+        let store_for_fetch = self.store.clone();
         stream! {
             let uuid = match uuid::Uuid::parse_str(&id) {
                 Ok(u) => u,
@@ -221,7 +256,11 @@ impl FacetHub {
                     return;
                 }
             };
-            let mut facet = match store.get_facet(uuid).await {
+            // Fetch existing for the in-place merge (the gate also fetches
+            // for its visibility check; one extra read is acceptable for
+            // the demo). If the caller can't see the facet, surface
+            // not_found via the gate's update path below.
+            let mut facet = match store_for_fetch.get_facet(uuid).await {
                 Ok(f) => f,
                 Err(StoreError::NotFound(_)) => {
                     yield TrakEvent::Error { code: Some("not_found".into()), message: format!("facet {id} not found") };
@@ -240,29 +279,46 @@ impl FacetHub {
                 priority,
                 meta_extra,
             };
-            // Apply the update (in-place). Even if no fields changed we still
-            // bump updated_at and persist for symmetry with the prior behavior
-            // (which always wrote regardless of change).
             update.apply(&mut facet);
             // Match prior behavior: always bump updated_at on update calls,
             // even if every field was None (no observable change). This keeps
             // the existing test_update_status invariant.
             facet.updated_at = chrono::Utc::now();
 
-            match store.update_facet(&facet).await {
-                Ok(()) => yield TrakEvent::FacetUpdated { facet },
+            match gate.update(facet).await {
+                Ok(facet) => yield TrakEvent::FacetUpdated { facet },
+                Err(GateError::Unauthenticated) => yield TrakEvent::Error {
+                    code: Some("unauthenticated".into()),
+                    message: "update requires an authenticated tenant".into(),
+                },
+                Err(GateError::Forbidden) => yield TrakEvent::Error {
+                    code: Some("forbidden".into()),
+                    message: "cannot update facet owned by another tenant".into(),
+                },
+                Err(GateError::NotFound) => yield TrakEvent::Error {
+                    code: Some("not_found".into()),
+                    message: format!("facet {id} not found"),
+                },
                 Err(e) => yield TrakEvent::Error { code: Some("update_failed".into()), message: e.to_string() },
             }
         }
     }
 
     /// Delete a facet
+    ///
+    /// **AUTHZ-TENANT-GATE:** previously anonymous-writable. Now routed
+    /// through `TenantGate::delete` which checks tenant ownership before
+    /// deletion. Foreign-tenant delete attempts return `Forbidden`.
     #[plexus_macros::method(
-        description = "Delete a facet by UUID",
+        description = "Delete a facet by UUID (tenant-scoped)",
         params(id = "Facet UUID")
     )]
-    async fn delete(&self, id: String) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+    async fn delete(
+        &self,
+        auth: &AuthContext,
+        id: String,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
         stream! {
             let uuid = match uuid::Uuid::parse_str(&id) {
                 Ok(u) => u,
@@ -271,9 +327,20 @@ impl FacetHub {
                     return;
                 }
             };
-            match store.delete_facet(uuid).await {
+            match gate.delete(uuid).await {
                 Ok(()) => yield TrakEvent::FacetDeleted { id: uuid },
-                Err(StoreError::NotFound(_)) => yield TrakEvent::Error { code: Some("not_found".into()), message: format!("facet {id} not found") },
+                Err(GateError::Unauthenticated) => yield TrakEvent::Error {
+                    code: Some("unauthenticated".into()),
+                    message: "delete requires an authenticated tenant".into(),
+                },
+                Err(GateError::Forbidden) => yield TrakEvent::Error {
+                    code: Some("forbidden".into()),
+                    message: "cannot delete facet owned by another tenant".into(),
+                },
+                Err(GateError::NotFound) => yield TrakEvent::Error {
+                    code: Some("not_found".into()),
+                    message: format!("facet {id} not found"),
+                },
                 Err(e) => yield TrakEvent::Error { code: Some("delete_failed".into()), message: e.to_string() },
             }
         }
@@ -343,11 +410,17 @@ impl FacetHub {
     )]
     async fn list(
         &self,
+        auth: &AuthContext,
         parent_id: Option<String>,
         tags: Option<Vec<String>>,
         tags_all: Option<Vec<String>>,
         priority: Option<Vec<String>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        // AUTHZ-TENANT-GATE: visibility-scoped listing. Foreign-tenant
+        // facets are filtered out via `TenantGate::list_children`. The
+        // tag/priority post-filter runs on the already-visibility-scoped
+        // set so callers don't see "ghost" totals.
+        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
         let store = self.store.clone();
         stream! {
             let parent_uuid = match parent_id.as_deref().map(uuid::Uuid::parse_str).transpose() {
@@ -357,7 +430,7 @@ impl FacetHub {
                     return;
                 }
             };
-            match store.list_children(parent_uuid).await {
+            match gate.list_children(parent_uuid).await {
                 Ok(facets) => {
                     let facets = filter_facets(facets, tags.as_deref(), tags_all.as_deref(), priority.as_deref());
                     let total = facets.len() as u32;

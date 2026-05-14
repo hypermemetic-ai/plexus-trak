@@ -19,6 +19,15 @@ plexus-core = "0.5"
 plexus-macros = "0.5"
 plexus-transport = "0.2"
 
+# Sealed auth primitives (Tenant, ClaimTenantResolver).
+# Path dep because plexus-core 0.5.2 (crates.io) predates the auth-core split,
+# so the registry version is not yet aware of plexus-auth-core. We consume the
+# tenant primitives directly. Note: this crate ships its OWN AuthContext;
+# plexus-trak handlers continue to use plexus_core::plexus::AuthContext, and
+# `TenantGate::from_auth` mirrors the field shape into a plexus_auth_core
+# AuthContext at construction time so the resolver primitive can be exercised.
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.1" }
+
 # Async
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

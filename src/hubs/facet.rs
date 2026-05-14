@@ -347,8 +347,20 @@ impl FacetHub {
     }
 
     /// Move a facet to a new parent
+    ///
+    /// **AUTHZ-TENANT-GATE:** previously took no auth — now requires
+    /// `auth: &AuthContext`. Routed through `TenantGate::move_to`, which
+    /// requires write access to **both** the source facet and (if
+    /// supplied) the new parent. This prevents the
+    /// "donate-to-foreign-tenant-tree" attack where Alice moves her
+    /// facet under Bob's parent, exposing it to Bob's namespace.
+    ///
+    /// TODO(AUTHZ-MACRO-OPTIONAL-AUTH-1): once `Option<&AuthContext>` is
+    /// supported by the macro, anonymous callers could be allowed to
+    /// move PUBLIC facets within the public tree. Today: write requires
+    /// auth.
     #[plexus_macros::method(
-        description = "Move a facet under a different parent (or to root)",
+        description = "Move a facet under a different parent (or to root). Caller must own both endpoints.",
         params(
             id = "Facet UUID to move",
             new_parent_id = "New parent UUID (omit to make root)"
@@ -356,10 +368,11 @@ impl FacetHub {
     )]
     async fn move_to(
         &self,
+        auth: &AuthContext,
         id: String,
         new_parent_id: Option<String>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
         stream! {
             let uuid = match uuid::Uuid::parse_str(&id) {
                 Ok(u) => u,
@@ -375,20 +388,20 @@ impl FacetHub {
                     return;
                 }
             };
-            // Fetch old parent first for the event.
-            let old_parent = match store.get_facet(uuid).await {
-                Ok(f) => f.parent_id,
-                Err(StoreError::NotFound(_)) => {
-                    yield TrakEvent::Error { code: Some("not_found".into()), message: format!("facet {id} not found") };
-                    return;
-                }
-                Err(e) => {
-                    yield TrakEvent::Error { code: Some("get_failed".into()), message: e.to_string() };
-                    return;
-                }
-            };
-            match store.move_facet(uuid, new_parent).await {
-                Ok(()) => yield TrakEvent::FacetMoved { id: uuid, old_parent, new_parent },
+            match gate.move_to(uuid, new_parent).await {
+                Ok(old_parent) => yield TrakEvent::FacetMoved { id: uuid, old_parent, new_parent },
+                Err(GateError::Unauthenticated) => yield TrakEvent::Error {
+                    code: Some("unauthenticated".into()),
+                    message: "move_to requires an authenticated tenant".into(),
+                },
+                Err(GateError::Forbidden) => yield TrakEvent::Error {
+                    code: Some("forbidden".into()),
+                    message: "cannot move across tenants".into(),
+                },
+                Err(GateError::NotFound) => yield TrakEvent::Error {
+                    code: Some("not_found".into()),
+                    message: format!("facet {id} not found"),
+                },
                 Err(e) => yield TrakEvent::Error { code: Some("move_failed".into()), message: e.to_string() },
             }
         }
@@ -452,11 +465,25 @@ impl FacetHub {
     }
 
     /// Get the full subtree rooted at a facet
+    ///
+    /// **AUTHZ-TENANT-GATE:** previously took no auth — now takes
+    /// `auth: Option<&AuthContext>` so anonymous callers can still
+    /// traverse public subtrees. The gate's `subtree` filters every
+    /// node by visibility; if the root is not visible to the caller
+    /// the traversal returns empty (no signal about subtree size).
+    ///
+    /// Uses AUTHZ-MACRO-OPTIONAL-AUTH-1 codegen: the macro emits a
+    /// pass-through for the `Option<&AuthContext>` parameter shape.
     #[plexus_macros::method(
-        description = "Recursively walk the subtree rooted at a facet",
+        description = "Recursively walk the subtree rooted at a facet (tenant-scoped)",
         params(id = "Root facet UUID")
     )]
-    async fn tree(&self, id: String) -> impl Stream<Item = TrakEvent> + Send + 'static {
+    async fn tree(
+        &self,
+        auth: Option<&AuthContext>,
+        id: String,
+    ) -> impl Stream<Item = TrakEvent> + Send + 'static {
+        let gate = TenantGate::from_auth(self.store.clone(), auth).await;
         let store = self.store.clone();
         stream! {
             let uuid = match uuid::Uuid::parse_str(&id) {
@@ -466,7 +493,7 @@ impl FacetHub {
                     return;
                 }
             };
-            match store.get_subtree(uuid).await {
+            match gate.subtree(uuid).await {
                 Ok(nodes) => {
                     let total = nodes.len() as u32;
                     for (facet, depth) in nodes {
@@ -487,8 +514,13 @@ impl FacetHub {
     }
 
     /// Create a link (edge) between two facets
+    ///
+    /// **AUTHZ-TENANT-GATE:** previously took no auth — now requires
+    /// `auth: &AuthContext` and the caller must have write access to
+    /// **both** endpoints. Closes the cross-tenant-edge attack
+    /// (attaching a foreign-tenant facet to one's own graph).
     #[plexus_macros::method(
-        description = "Create a typed link between two facets",
+        description = "Create a typed link between two facets (caller must own both endpoints)",
         params(
             from_id = "Source facet UUID",
             to_id = "Target facet UUID",
@@ -497,11 +529,12 @@ impl FacetHub {
     )]
     async fn link(
         &self,
+        auth: &AuthContext,
         from_id: String,
         to_id: String,
         kind: String,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
         stream! {
             let from = match uuid::Uuid::parse_str(&from_id) {
                 Ok(u) => u,
@@ -530,16 +563,31 @@ impl FacetHub {
                 kind: edge_kind,
                 created_at: chrono::Utc::now(),
             };
-            match store.add_edge(&edge).await {
-                Ok(()) => yield TrakEvent::LinkCreated { edge },
+            match gate.add_edge(edge).await {
+                Ok(edge) => yield TrakEvent::LinkCreated { edge },
+                Err(GateError::Unauthenticated) => yield TrakEvent::Error {
+                    code: Some("unauthenticated".into()),
+                    message: "link requires an authenticated tenant".into(),
+                },
+                Err(GateError::Forbidden) => yield TrakEvent::Error {
+                    code: Some("forbidden".into()),
+                    message: "cannot link across tenants".into(),
+                },
+                Err(GateError::NotFound) => yield TrakEvent::Error {
+                    code: Some("not_found".into()),
+                    message: "facet not found".into(),
+                },
                 Err(e) => yield TrakEvent::Error { code: Some("link_failed".into()), message: e.to_string() },
             }
         }
     }
 
     /// Remove a link between two facets
+    ///
+    /// **AUTHZ-TENANT-GATE:** mirror of `link` — caller must have write
+    /// access to both endpoints.
     #[plexus_macros::method(
-        description = "Remove a typed link between two facets",
+        description = "Remove a typed link between two facets (caller must own both endpoints)",
         params(
             from_id = "Source facet UUID",
             to_id = "Target facet UUID",
@@ -548,11 +596,12 @@ impl FacetHub {
     )]
     async fn unlink(
         &self,
+        auth: &AuthContext,
         from_id: String,
         to_id: String,
         kind: String,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
         stream! {
             let from = match uuid::Uuid::parse_str(&from_id) {
                 Ok(u) => u,
@@ -575,16 +624,36 @@ impl FacetHub {
                     return;
                 }
             };
-            match store.remove_edge(from, to, &edge_kind).await {
+            match gate.remove_edge(from, to, &edge_kind).await {
                 Ok(()) => yield TrakEvent::LinkRemoved { from_id: from, to_id: to, kind },
+                Err(GateError::Unauthenticated) => yield TrakEvent::Error {
+                    code: Some("unauthenticated".into()),
+                    message: "unlink requires an authenticated tenant".into(),
+                },
+                Err(GateError::Forbidden) => yield TrakEvent::Error {
+                    code: Some("forbidden".into()),
+                    message: "cannot unlink across tenants".into(),
+                },
+                Err(GateError::NotFound) => yield TrakEvent::Error {
+                    code: Some("not_found".into()),
+                    message: "facet not found".into(),
+                },
                 Err(e) => yield TrakEvent::Error { code: Some("unlink_failed".into()), message: e.to_string() },
             }
         }
     }
 
     /// List links for a facet
+    ///
+    /// **AUTHZ-TENANT-GATE:** previously took no auth — now takes
+    /// `auth: Option<&AuthContext>`. Edges are filtered so both
+    /// endpoints must be visible. A half-visible edge would leak
+    /// existence of the invisible endpoint, so dropping it is correct.
+    /// Anonymous callers can inspect edges between public facets.
+    ///
+    /// Uses AUTHZ-MACRO-OPTIONAL-AUTH-1 codegen.
     #[plexus_macros::method(
-        description = "List edges connected to a facet",
+        description = "List edges connected to a facet (both endpoints visibility-filtered)",
         params(
             id = "Facet UUID",
             direction = "outgoing, incoming, or both (default: both)",
@@ -593,11 +662,12 @@ impl FacetHub {
     )]
     async fn links(
         &self,
+        auth: Option<&AuthContext>,
         id: String,
         direction: Option<String>,
         kind: Option<String>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        let gate = TenantGate::from_auth(self.store.clone(), auth).await;
         stream! {
             let uuid = match uuid::Uuid::parse_str(&id) {
                 Ok(u) => u,
@@ -622,27 +692,42 @@ impl FacetHub {
                     return;
                 }
             };
-            match store.get_edges(uuid, dir, edge_kind.as_ref()).await {
+            match gate.edges(uuid, dir, edge_kind.as_ref()).await {
                 Ok(edges) => {
                     for edge in edges {
                         yield TrakEvent::LinkDetail { edge };
                     }
                 }
+                Err(GateError::NotFound) => yield TrakEvent::Error {
+                    code: Some("not_found".into()),
+                    message: format!("facet {id} not found"),
+                },
                 Err(e) => yield TrakEvent::Error { code: Some("links_failed".into()), message: e.to_string() },
             }
         }
     }
 
     /// Find blocked facets
+    ///
+    /// **AUTHZ-TENANT-GATE:** previously took no auth — now takes
+    /// `auth: Option<&AuthContext>`. Routed through
+    /// `TenantGate::blocked_in`, which (a) filters the parent's
+    /// children by visibility, and (b) drops dependencies whose target
+    /// lives in a foreign tenant. Cross-tenant blockers are hidden —
+    /// confirming their existence would leak schedule signal across the
+    /// boundary.
+    ///
+    /// Uses AUTHZ-MACRO-OPTIONAL-AUTH-1 codegen.
     #[plexus_macros::method(
-        description = "Find facets that are blocked by non-done dependencies",
+        description = "Find facets blocked by non-done dependencies (tenant-scoped)",
         params(parent_id = "Scope search to children of this parent (optional)")
     )]
     async fn blocked(
         &self,
+        auth: Option<&AuthContext>,
         parent_id: Option<String>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        let gate = TenantGate::from_auth(self.store.clone(), auth).await;
         stream! {
             let parent_uuid = match parent_id.as_deref().map(uuid::Uuid::parse_str).transpose() {
                 Ok(v) => v,
@@ -651,29 +736,13 @@ impl FacetHub {
                     return;
                 }
             };
-            let facets = match store.list_children(parent_uuid).await {
-                Ok(f) => f,
-                Err(e) => {
-                    yield TrakEvent::Error { code: Some("list_failed".into()), message: e.to_string() };
-                    return;
-                }
-            };
-            for facet in facets {
-                let deps = match store.get_edges(facet.id, Direction::Outgoing, Some(&EdgeKind::DependsOn)).await {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                let mut blockers = Vec::new();
-                for dep in &deps {
-                    if let Ok(target) = store.get_facet(dep.to_id).await {
-                        if target.status != "done" {
-                            blockers.push(dep.to_id);
-                        }
+            match gate.blocked_in(parent_uuid).await {
+                Ok(report) => {
+                    for (facet, blocked_by) in report {
+                        yield TrakEvent::Blocked { facet, blocked_by };
                     }
                 }
-                if !blockers.is_empty() {
-                    yield TrakEvent::Blocked { facet, blocked_by: blockers };
-                }
+                Err(e) => yield TrakEvent::Error { code: Some("list_failed".into()), message: e.to_string() },
             }
         }
     }
@@ -683,8 +752,15 @@ impl FacetHub {
     /// Optional tag/priority filters post-filter FTS5 results. FTS5 ranking
     /// order is unchanged when no filters apply (the filter is a stable
     /// retain over the already-sorted result vec).
+    ///
+    /// **AUTHZ-TENANT-GATE:** previously took no auth — now takes
+    /// `auth: Option<&AuthContext>`. Routed through
+    /// `TenantGate::search`, which post-filters FTS5 matches by
+    /// visibility. Foreign-tenant matches never reach the wire.
+    ///
+    /// Uses AUTHZ-MACRO-OPTIONAL-AUTH-1 codegen.
     #[plexus_macros::method(
-        description = "Full-text search across facet titles and bodies. Optionally filter by tags / priority.",
+        description = "Full-text search across facet titles and bodies (tenant-scoped). Optionally filter by tags / priority.",
         params(
             query = "Search query (FTS5 syntax)",
             tags = "OR filter: keep facets whose tags include any of these",
@@ -694,14 +770,15 @@ impl FacetHub {
     )]
     async fn search(
         &self,
+        auth: Option<&AuthContext>,
         query: String,
         tags: Option<Vec<String>>,
         tags_all: Option<Vec<String>>,
         priority: Option<Vec<String>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        let gate = TenantGate::from_auth(self.store.clone(), auth).await;
         stream! {
-            match store.search(&query).await {
+            match gate.search(&query).await {
                 Ok(results) => {
                     let tags_any = tags.as_deref().filter(|t| !t.is_empty());
                     let tags_all = tags_all.as_deref().filter(|t| !t.is_empty());
@@ -725,8 +802,17 @@ impl FacetHub {
     }
 
     /// Regex search across facet titles and bodies
+    ///
+    /// **AUTHZ-TENANT-GATE:** previously took no auth — now takes
+    /// `auth: Option<&AuthContext>`. Scoped scans (`parent_id` set)
+    /// use `gate.subtree`; full-store scans use
+    /// `gate.collect_all_visible`. Foreign-tenant facets are filtered
+    /// out before regex match so the caller cannot see their titles
+    /// or bodies.
+    ///
+    /// Uses AUTHZ-MACRO-OPTIONAL-AUTH-1 codegen.
     #[plexus_macros::method(
-        description = "Search facets by regex pattern against title and body. Returns all matches.",
+        description = "Search facets by regex pattern against title and body (tenant-scoped). Returns all matches.",
         params(
             pattern = "Regex pattern (Rust regex syntax)",
             status = "Filter by status (optional)",
@@ -738,6 +824,7 @@ impl FacetHub {
     )]
     async fn grep(
         &self,
+        auth: Option<&AuthContext>,
         pattern: String,
         status: Option<String>,
         parent_id: Option<String>,
@@ -745,7 +832,7 @@ impl FacetHub {
         tags_all: Option<Vec<String>>,
         priority: Option<Vec<String>>,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let store = self.store.clone();
+        let gate = TenantGate::from_auth(self.store.clone(), auth).await;
         stream! {
             let re = match regex::Regex::new(&pattern) {
                 Ok(r) => r,
@@ -758,12 +845,13 @@ impl FacetHub {
                 }
             };
 
-            // Load facets to scan
+            // Load facets to scan — all tenant-visibility-filtered up front.
             let facets = if let Some(ref pid) = parent_id {
                 match uuid::Uuid::parse_str(pid) {
                     Ok(parent_uuid) => {
-                        // Get full subtree under parent
-                        match store.get_subtree(parent_uuid).await {
+                        // Gate.subtree returns empty for invisible roots,
+                        // which collapses cross-tenant probes silently.
+                        match gate.subtree(parent_uuid).await {
                             Ok(items) => items.into_iter().map(|(f, _depth)| f).collect::<Vec<_>>(),
                             Err(e) => {
                                 yield TrakEvent::Error { code: Some("grep_failed".into()), message: e.to_string() };
@@ -777,18 +865,8 @@ impl FacetHub {
                     }
                 }
             } else {
-                // Scan all roots + their subtrees
-                match store.list_roots().await {
-                    Ok(roots) => {
-                        let mut all = Vec::new();
-                        for root in &roots {
-                            all.push(root.clone());
-                            if let Ok(children) = store.get_subtree(root.id).await {
-                                all.extend(children.into_iter().map(|(f, _)| f));
-                            }
-                        }
-                        all
-                    }
+                match gate.collect_all_visible().await {
+                    Ok(all) => all,
                     Err(e) => {
                         yield TrakEvent::Error { code: Some("grep_failed".into()), message: e.to_string() };
                         return;

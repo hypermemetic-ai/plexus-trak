@@ -15,17 +15,35 @@ path = "src/bin/main.rs"
 
 [dependencies]
 # Plexus RPC
-plexus-core = "0.5"
-plexus-macros = "0.5"
-plexus-transport = "0.2"
+#
+# plexus-core is consumed via path dep (workspace) to pick up
+# AUTHZ-CORE-CRATE-1 — the migration that re-exports `AuthContext` and other
+# auth primitives from `plexus-auth-core`. With the path dep,
+# `plexus_core::plexus::AuthContext` IS `plexus_auth_core::AuthContext`,
+# so the field-mirroring shim in `TenantGate::from_auth` is gone and the
+# trak handlers + resolver primitive share one type.
+plexus-core = { path = "../plexus-core", version = "0.5" }
+# Workspace path deps for the rest of the plexus stack. Required because
+# `plexus-transport` (and `plexus-macros`) pin a workspace `plexus-core`
+# via path; mixing path-dep `plexus-core` here with crates.io
+# `plexus-transport` produces two distinct `plexus_core` crates in the
+# dep graph, which makes `DynamicHub: Activation` fail to satisfy.
+#
+# `plexus-macros` is pinned at the SAME physical path that plexus-core
+# uses. Multiple in-flight macros worktrees exist (each disambiguated
+# by a pre-release version tag); the workspace `plexus-core/Cargo.toml`
+# currently points at `plexus-macros-AUTHZ-MACRO-OPTIONAL-AUTH-1`,
+# which carries the AUTHZ-MACRO-OPTIONAL-AUTH-1 codegen fix
+# (`Option<&AuthContext>` pass-through). We align to the same physical
+# path so cargo sees one `plexus-macros` package id; the matching
+# `version` requirement is loose so a future bump on either side stays
+# compatible.
+plexus-macros = { path = "../plexus-macros-AUTHZ-MACRO-OPTIONAL-AUTH-1" }
+plexus-transport = { path = "../plexus-transport", version = "0.3" }
 
-# Sealed auth primitives (Tenant, ClaimTenantResolver).
-# Path dep because plexus-core 0.5.2 (crates.io) predates the auth-core split,
-# so the registry version is not yet aware of plexus-auth-core. We consume the
-# tenant primitives directly. Note: this crate ships its OWN AuthContext;
-# plexus-trak handlers continue to use plexus_core::plexus::AuthContext, and
-# `TenantGate::from_auth` mirrors the field shape into a plexus_auth_core
-# AuthContext at construction time so the resolver primitive can be exercised.
+# Sealed auth primitives (Tenant, ClaimTenantResolver, AuthContext).
+# Path dep so the AuthContext type used in trak handlers is identical to the
+# one expected by `ClaimTenantResolver::resolve`.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.1" }
 
 # Async

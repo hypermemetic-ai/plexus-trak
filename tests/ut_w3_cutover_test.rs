@@ -292,6 +292,55 @@ async fn oidc_context_carries_real_session_id_and_writes_succeed() {
     );
 }
 
+// ─── 2b. identity.me answers from OIDC claims (defect bdf7d5f9) ──────────
+
+#[tokio::test]
+async fn identity_me_answers_from_oidc_claims_without_db_lookup() {
+    // Defect bdf7d5f9: post-cutover the OIDC validator mints a verified
+    // identity from RS256 claims (sub/username/org_id), but `identity.me`
+    // still did a local users-table lookup by that sub — and the IdP
+    // subject is NOT a trak users row. The lookup failed with
+    // `user_lookup_failed: ... user not found: <idp-sub>`, surfacing as
+    // the UIs' boot-error banner on reload. The fix: `me` returns the
+    // verified claims straight from the AuthContext for OIDC callers, no
+    // DB round-trip.
+    let (store, _dir) = temp_store().await;
+    let identity_hub = IdentityHub::new(
+        IdentityStore::new(store.pool().clone()),
+        b"test-secret-32-bytes-minimum-len".to_vec(),
+    );
+
+    // OIDC context whose `sub` has NO corresponding trak users row — the
+    // store is empty, so any get_user_by_id would error. (`ctx_for`
+    // authenticates a fixture RS256 token through the real TrakAuth.)
+    let ctx = ctx_for(&store, "idp-subject-no-local-row", "org_acme").await;
+    assert_eq!(ctx.get_metadata_string("auth_method").as_deref(), Some("oidc"));
+
+    let events = drain(
+        identity_hub
+            .call("me", json!({}), Some(&ctx), None)
+            .await
+            .expect("authed me must dispatch"),
+    )
+    .await;
+
+    let (ty, code) = first_type_code(&events);
+    assert_eq!(
+        ty, "user_info",
+        "me must answer from claims (got {ty} {code:?}) — the DB lookup \
+         on the IdP sub would have yielded user_lookup_failed"
+    );
+    let info = &events[0];
+    assert_eq!(info["user_id"].as_str(), Some("idp-subject-no-local-row"));
+    assert_eq!(info["username"].as_str(), Some("idp-subject-no-local-row"));
+    // org_id resolves through the tenant_id dual-key alias.
+    assert_eq!(info["tenant"].as_str(), Some("org_acme"));
+    assert_eq!(
+        info["roles"].as_array().map(|r| r.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+        Some(vec!["user"]),
+    );
+}
+
 // ─── 3. Gate-adapter equivalence, end-to-end through dispatch ────────────
 
 #[tokio::test]

@@ -391,6 +391,18 @@ impl IdentityHub {
     }
 
     /// Get the current user's info
+    ///
+    /// UT-W3 (defect bdf7d5f9): OIDC-authed callers carry a *verified*
+    /// identity minted from RS256 token claims (sub/username/org_id) by
+    /// `OidcSessionValidator` — their `sub` is an IdP subject, not a trak
+    /// `users` row. Answering `me` from a local `get_user_by_id(sub)`
+    /// lookup therefore failed with `user_not_found` post-cutover (the
+    /// boot-error banner on UI reload). The validator already produced a
+    /// trustworthy identity, so for OIDC callers we return it straight
+    /// from the [`AuthContext`] with no DB round-trip. Legacy callers
+    /// (API-key / local, `auth_method != "oidc"`) keep the user-table
+    /// lookup — they genuinely have a row, and it carries the canonical
+    /// `display_name` the claims don't.
     #[plexus_macros::method(
         description = "Return current user info from the auth context (requires authentication)"
     )]
@@ -400,7 +412,33 @@ impl IdentityHub {
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
         let store = self.store.clone();
         let user_id = auth.user_id.clone();
+        let is_oidc = auth.get_metadata_string("auth_method").as_deref() == Some("oidc");
+        // OIDC contexts expose the verified claims via metadata. `username`
+        // is part of the plexus-idp token contract; fall back to the subject
+        // if a token ever omits it.
+        let claim_username = auth
+            .get_metadata_string("username")
+            .unwrap_or_else(|| user_id.clone());
+        // `tenant()` reads `tenant_id` (the dual-key alias the validator
+        // mints next to `org_id`), falling back to `realm`.
+        let claim_tenant = auth.tenant();
+        let claim_roles = auth.roles.clone();
         stream! {
+            // OIDC callers: answer from the sealed VerifiedUser claims; the
+            // IdP subject has no local row and must not be looked up.
+            if is_oidc {
+                yield TrakEvent::UserInfo {
+                    user_id: user_id.clone(),
+                    username: claim_username,
+                    // The OIDC token carries no display name; the IdP owns it.
+                    display_name: None,
+                    roles: claim_roles,
+                    tenant: claim_tenant,
+                };
+                return;
+            }
+
+            // Legacy (API-key / local) callers: a real trak row exists.
             match store.get_user_by_id(&user_id).await {
                 Ok(user) => {
                     yield TrakEvent::UserInfo {

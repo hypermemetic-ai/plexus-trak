@@ -1,66 +1,99 @@
 //! `TenantGate` — handler-side tenant-isolation wrapper around `FacetStore`.
 //!
-//! This is a **trak-local** demonstration of multi-tenant isolation built on
-//! the *usable* primitives now exported by `plexus-auth-core`:
+//! **UT-W3 (wave 3): this is now a thin adapter** over the generalized
+//! [`plexus_auth_core_ut1::TenantGate`] extracted by UT-1, exactly per the
+//! adapter shape documented in that module ("Adapter shape: how trak swaps
+//! in"). What remains here is the trak-specific part the extraction
+//! deliberately left behind:
 //!
-//! - [`plexus_auth_core::Tenant`] — sealed unit of data isolation. Its
-//!   constructor is crate-private; the only path to a `Tenant` value is via
-//!   the framework's `TenantResolver`.
-//! - [`plexus_auth_core::ClaimTenantResolver`] — reads `tenant_id` from the
-//!   verified `AuthContext` metadata and (with `single_user_fallback = true`)
-//!   falls back to the user id for single-user deployments.
+//! - the `FacetStore` plumbing (which store call to make, how to walk
+//!   subtrees / edges / blockers), and
+//! - the storage placement of the tenant tag (`meta.extra["tenant"]`),
+//!   expressed via the [`TenantTagged`] impl for [`Facet`].
 //!
-//! # Why not `Tenanted<S>` / `Scoped<'_, S>`?
+//! The predicates (`can_see` / `can_write`), the denial taxonomy
+//! (read-denial = NotFound existence-oracle defense, write-denial =
+//! Forbidden, anonymous write = Unauthenticated), the `is_authenticated()`
+//! defense-in-depth check, and the create-stamp / update-preserve
+//! tenant-hop defenses all live in `plexus_auth_core_ut1::TenantGate` now
+//! — behavior is unchanged because the predicates were extracted verbatim
+//! (pinned by `tests/tenant_isolation_test.rs`, the same pentest suite
+//! that pinned the pre-adapter gate).
 //!
-//! Wave 1+2 of AUTHZ landed `Tenanted<S>` and `Scoped<'_, S>` in
-//! `plexus-auth-core::tenant::storage`, but the `TenantScopedStore` trait is
-//! sealed and `Tenanted::new_sealed` is `pub(crate)` — a third crate cannot
-//! wrap its own store in `Tenanted`. That gap is tracked by
-//! `AUTHZ-DATA-2-MACRO` (Pending). Until that ticket lands, downstream crates
-//! that need tenant isolation today must roll a handler-side gate (this
-//! module). The gate is intentionally NOT introduced as a new public API in
-//! `plexus-auth-core`; it lives in trak.
+//! One deliberate refinement rides the adapter: anonymous `update` /
+//! `delete` now surface [`GateError::Unauthenticated`] instead of
+//! [`GateError::Forbidden`]. The pre-adapter suite documented this exact
+//! change as desirable ("We could surface Unauthenticated specifically by
+//! early-returning…"); the generalized gate's `authorize_write` does it
+//! structurally. The wire-level outcome for an attacker is identical: the
+//! operation fails.
+//!
+//! # Tenancy claim (UT-S01 D3)
+//!
+//! The resolver is [`ClaimTenantResolver::new`] — default claim key
+//! **`org_id`** (Auth0 Organizations convention) with the one-window
+//! `tenant_id` deprecation alias, so pre-cutover HS256-era contexts that
+//! carry only `tenant_id` keep resolving while the OIDC validator writes
+//! both keys. Facet **storage** keeps `meta.extra["tenant"]` — no data
+//! migration in UT-W3; only the claim side moved to `org_id`.
 //!
 //! # Threat model
 //!
-//! The gate sits **after** session validation (so `AuthContext` is always
-//! trustworthy at this layer — forging it is outside the trust boundary) and
-//! **before** the store. It defends:
-//!
-//! 1. **Cross-tenant reads** — tenant B asking for tenant A's facet by UUID
-//!    must receive `NotFound` (not `Forbidden`) to avoid an existence-oracle
-//!    leak.
-//! 2. **Cross-tenant writes** — tenant B updating / deleting tenant A's
-//!    facet must receive `Forbidden`. Existence is already exposed by the
-//!    create path, so write-side denials use the more honest signal.
-//! 3. **Cross-tenant listing** — `list_children` post-filters the store's
-//!    result vec so a caller never sees a foreign-tenant facet in the
-//!    output. (Inefficient for tenant-private datasets; correct for the
-//!    demo. Push-down filtering is a follow-up.)
-//! 4. **Tenant hopping via metadata** — a caller cannot move a facet to
-//!    another tenant by setting `meta_extra.tenant = "B"`. On create, the
-//!    caller's resolved tenant overwrites any forged value; on update, the
-//!    existing tenant value is preserved verbatim.
-//! 5. **Anonymous writes** — `create`, `update`, `delete` always return
-//!    `Unauthenticated` for callers with no resolved tenant.
-//! 6. **Forged `AuthContext`** — an `AuthContext` carrying a `tenant_id`
-//!    claim but no valid session (`is_authenticated() == false`, e.g.
-//!    empty `session_id`) is rejected by `ClaimTenantResolver` and the
-//!    gate treats the caller as anonymous.
-//!
-//! Each item is verified by a test in `tests/tenant_isolation_test.rs`.
+//! Unchanged — see `plexus_auth_core_ut1::tenant::gate` module docs for
+//! the canonical statement; `tests/tenant_isolation_test.rs` verifies each
+//! item end-to-end against the real `SqliteStore`.
 
 use std::sync::Arc;
 
-// `AuthContext` is re-exported by `plexus-core` from `plexus-auth-core`
-// (AUTHZ-CORE-CRATE-1). Importing directly from `plexus_auth_core` here
-// makes the resolver primitive's signature line up without any field
-// mirroring; `plexus_core::plexus::AuthContext` is the same type.
-use plexus_auth_core::{AuthContext, ClaimTenantResolver, Tenant, TenantResolver};
+// The handlers' AuthContext: `plexus_core::plexus::AuthContext`, which is
+// the pre-UT-1 `plexus_auth_core::AuthContext` re-export.
+use plexus_core::plexus::AuthContext;
+// The UT-1 surface (generalized gate + org_id resolver) comes from the
+// unmerged feature/UT-1-tenancy-oidc branch via the ut1-auth-core shim.
+// TODO: s/plexus_auth_core_ut1/plexus_auth_core/ once UT-1 merges.
+use plexus_auth_core_ut1::{
+    ClaimTenantResolver, GateDenial, Tenant, TenantId, TenantTagged,
+};
 use uuid::Uuid;
 
 use crate::store::{Direction, FacetStore, StoreError};
 use crate::types::{Edge, EdgeKind, Facet};
+
+/// UT-W3-MIRROR: field-for-field bridge from the handlers' AuthContext
+/// (`plexus_core::plexus::AuthContext`, i.e. the pre-UT-1
+/// `plexus_auth_core` crate) to the UT-1 branch's nominally-distinct
+/// `AuthContext`. The two structs are identical (`user_id`, `session_id`,
+/// `roles`, `metadata`); they differ only in crate identity while UT-1 is
+/// unmerged. DELETE this together with the ut1-auth-core shim once
+/// feature/UT-1-tenancy-oidc merges (the types collapse into one).
+pub(crate) fn mirror_auth(ctx: &AuthContext) -> plexus_auth_core_ut1::AuthContext {
+    plexus_auth_core_ut1::AuthContext::new(
+        ctx.user_id.clone(),
+        ctx.session_id.clone(),
+        ctx.roles.clone(),
+        ctx.metadata.clone(),
+    )
+}
+
+/// trak's resources declare where their tenant tag lives: the
+/// `meta.extra["tenant"]` bag (no data migration in UT-W3 — storage keeps
+/// the `tenant` key; the **claim** side moved to `org_id` per UT-S01 D3).
+///
+/// Per the `TenantTagged` contract, a stored tag that fails `TenantId`
+/// validation must NOT map to `None` (that would silently publish the
+/// resource). `TenantId` validation is broad (printable ASCII ≤ 256
+/// bytes), so a failing tag means corrupt data; we conservatively map it
+/// to a sentinel tenant value that can never equal a caller's resolved
+/// tenant, keeping the resource invisible/unwritable rather than public.
+impl TenantTagged for Facet {
+    fn tenant_tag(&self) -> Option<TenantId> {
+        let raw = self.meta.extra.get("tenant").and_then(|v| v.as_str())?;
+        Some(TenantId::try_new(raw).unwrap_or_else(|_| {
+            TenantId::try_new("__corrupt-tenant-tag__")
+                .expect("sentinel tag is valid printable ASCII")
+        }))
+    }
+}
 
 /// Failure modes for [`TenantGate`] operations.
 ///
@@ -87,95 +120,76 @@ pub enum GateError {
     Store(#[from] StoreError),
 }
 
+impl From<GateDenial> for GateError {
+    fn from(d: GateDenial) -> Self {
+        match d {
+            GateDenial::NotFound => GateError::NotFound,
+            GateDenial::Forbidden => GateError::Forbidden,
+            GateDenial::Unauthenticated => GateError::Unauthenticated,
+        }
+    }
+}
+
 /// Tenant-isolating wrapper around a [`FacetStore`].
 ///
 /// One `TenantGate` is constructed per request via [`TenantGate::from_auth`].
 /// It holds:
 ///
 /// - The shared `Arc<dyn FacetStore>` (no per-request allocation).
-/// - The caller's resolved [`Tenant`], or `None` if the caller is anonymous
-///   or could not be resolved.
+/// - The generalized [`plexus_auth_core_ut1::TenantGate`] carrying the
+///   caller's resolved [`Tenant`] (or anonymous).
 ///
-/// All accessors enforce the visibility / write predicates documented at the
-/// module level.
+/// All accessors enforce the visibility / write predicates via the
+/// generalized gate.
 pub struct TenantGate {
     store: Arc<dyn FacetStore>,
-    tenant: Option<Tenant>,
+    gate: plexus_auth_core_ut1::TenantGate,
 }
 
 impl TenantGate {
     /// Build a gate for the given store and (optional) caller context.
     ///
-    /// Resolution flow:
+    /// Resolution flow (now inside
+    /// `plexus_auth_core_ut1::TenantGate::from_auth`):
     ///
-    /// 1. If `auth` is `None`, the gate has `tenant = None` (anonymous).
-    /// 2. Otherwise, the `AuthContext` is passed to
-    ///    [`ClaimTenantResolver::new`] (claim key `"tenant_id"`,
-    ///    `single_user_fallback = true`).
-    /// 3. On resolver success → `tenant = Some(...)`.
-    /// 4. On resolver error (anonymous, missing claim, malformed) →
-    ///    `tenant = None`.
-    ///
-    /// Post-AUTHZ-CORE-CRATE-1 the `plexus_core::plexus::AuthContext` used
-    /// by trak handlers is the **same type** as the
-    /// `plexus_auth_core::AuthContext` the resolver consumes (it's a
-    /// re-export). No field mirroring is required.
+    /// 1. `auth == None` → anonymous gate.
+    /// 2. `auth.is_authenticated() == false` → anonymous gate (the
+    ///    defense-in-depth check pinned by
+    ///    `forged_authcontext_does_not_grant_tenant`).
+    /// 3. Otherwise [`ClaimTenantResolver::new`] runs — claim key `org_id`,
+    ///    `tenant_id` deprecation alias, `single_user_fallback = true`.
+    ///    `Ok` → tenant gate, `Err` → anonymous gate.
     pub async fn from_auth(
         store: Arc<dyn FacetStore>,
         auth: Option<&AuthContext>,
     ) -> Self {
-        let tenant = match auth {
-            None => None,
-            Some(ctx) => {
-                // Defense in depth: ClaimTenantResolver does NOT itself
-                // check `is_authenticated()` when a claim is present (the
-                // resolver trusts the AuthContext post-SessionValidator).
-                // The gate adds a belt-and-suspenders check so a caller
-                // who hand-crafts an AuthContext with a tenant_id claim
-                // but an empty session_id still resolves to anonymous.
-                // The `forged_authcontext_does_not_grant_tenant` pentest
-                // pins this layered defense.
-                if !ctx.is_authenticated() {
-                    None
-                } else {
-                    let resolver = ClaimTenantResolver::new();
-                    resolver.resolve(ctx).await.ok()
-                }
-            }
-        };
-        Self { store, tenant }
+        // UT-W3-MIRROR: bridge the nominally-distinct AuthContext types
+        // while UT-1 is unmerged (see mirror_auth).
+        let mirrored = auth.map(mirror_auth);
+        let resolver = ClaimTenantResolver::new();
+        let gate =
+            plexus_auth_core_ut1::TenantGate::from_auth(&resolver, mirrored.as_ref()).await;
+        Self { store, gate }
     }
 
     /// The caller's resolved tenant, if any. `None` ↔ anonymous.
     pub fn caller_tenant(&self) -> Option<&Tenant> {
-        self.tenant.as_ref()
-    }
-
-    /// Read the tenant attribute stored on a facet (in `meta.extra["tenant"]`).
-    ///
-    /// Tenancy is currently encoded in the facet's metadata bag rather than a
-    /// dedicated column. This helper centralizes the lookup so it stays one
-    /// line to change when AUTHZ-DATA-2-MACRO adds proper `tenant_id`
-    /// scoping at the store layer.
-    fn facet_tenant_str(facet: &Facet) -> Option<&str> {
-        facet.meta.extra.get("tenant").and_then(|v| v.as_str())
+        self.gate.caller_tenant()
     }
 
     /// Visibility predicate: can the caller see this facet?
+    ///
+    /// Delegates to the generalized gate's matrix (see
+    /// `plexus_auth_core_ut1::TenantGate` docs):
     ///
     /// | caller     | facet.tenant   | result |
     /// |------------|----------------|--------|
     /// | `None`     | `None`         | `true` (anonymous sees public) |
     /// | `None`     | `Some(_)`      | `false` (anonymous cannot see tenant-owned) |
     /// | `Some(t)`  | `None`         | `true` (tenant sees public) |
-    /// | `Some(t)`  | `Some(ft)`     | `t.as_str() == ft` |
+    /// | `Some(t)`  | `Some(ft)`     | `t == ft` |
     pub fn can_see(&self, facet: &Facet) -> bool {
-        match (self.tenant.as_ref(), Self::facet_tenant_str(facet)) {
-            (None, None) => true,
-            (None, Some(_)) => false,
-            (Some(_), None) => true,
-            (Some(t), Some(ft)) => t.as_str() == ft,
-        }
+        self.gate.visible(facet)
     }
 
     /// Write predicate: can the caller mutate this facet?
@@ -183,33 +197,27 @@ impl TenantGate {
     /// Writes always require an authenticated tenant. A tenant can mutate
     /// public (untenanted) facets and facets in its own tenant.
     pub fn can_write(&self, facet: &Facet) -> bool {
-        match (self.tenant.as_ref(), Self::facet_tenant_str(facet)) {
-            (None, _) => false,
-            (Some(_), None) => true,
-            (Some(t), Some(ft)) => t.as_str() == ft,
-        }
+        self.gate.can_write(facet.tenant_tag().as_ref())
     }
 
     // ─── Store-mirror methods (visibility-enforced) ──────────────────────
 
     /// Create a facet on behalf of the caller.
     ///
-    /// - Requires an authenticated caller (`tenant.is_some()`); anonymous
-    ///   callers receive [`GateError::Unauthenticated`].
+    /// - Requires an authenticated caller; anonymous callers receive
+    ///   [`GateError::Unauthenticated`] (via `stamp`).
     /// - **Forces** `facet.meta.extra["tenant"]` to the caller's resolved
-    ///   tenant, **overwriting** any forged value the caller may have
-    ///   tried to set. This is the structural fix for the "tenant hop via
-    ///   create metadata" attack.
+    ///   tenant ([`plexus_auth_core_ut1::TenantGate::stamp`]), overwriting
+    ///   any forged value the caller may have tried to set. This is the
+    ///   structural fix for the "tenant hop via create metadata" attack.
     pub async fn create(&self, mut facet: Facet) -> Result<Facet, GateError> {
-        let Some(t) = self.tenant.as_ref() else {
-            return Err(GateError::Unauthenticated);
-        };
         // Caller's resolved tenant wins. Any caller-supplied `tenant` value
         // in meta_extra is discarded — overwriting is intentional, see the
         // `tenant_cannot_hop_via_create_metadata_override` pentest.
+        let stamp = self.gate.stamp()?;
         facet.meta.extra.insert(
             "tenant".to_string(),
-            serde_json::Value::String(t.as_str().to_string()),
+            serde_json::Value::String(stamp.as_str().to_string()),
         );
         self.store.create_facet(&facet).await?;
         Ok(facet)
@@ -220,42 +228,41 @@ impl TenantGate {
     /// Returns [`GateError::NotFound`] when the facet does not exist OR when
     /// the caller cannot see it. The two cases are indistinguishable to the
     /// caller by design — a foreign-tenant probe cannot use the gate as an
-    /// existence oracle.
+    /// existence oracle
+    /// ([`plexus_auth_core_ut1::TenantGate::authorize_read_of`]).
     pub async fn get(&self, id: Uuid) -> Result<Facet, GateError> {
         let facet = match self.store.get_facet(id).await {
             Ok(f) => f,
             Err(StoreError::NotFound(_)) => return Err(GateError::NotFound),
             Err(e) => return Err(GateError::Store(e)),
         };
-        if !self.can_see(&facet) {
-            return Err(GateError::NotFound);
-        }
+        self.gate.authorize_read_of(&facet)?;
         Ok(facet)
     }
 
     /// Update a facet.
     ///
-    /// - Returns [`GateError::NotFound`] if the target doesn't exist (the
-    ///   underlying not-found is the same for write paths; we surface
-    ///   `NotFound` rather than `Forbidden` for the not-exists case so
+    /// - Returns [`GateError::NotFound`] if the target doesn't exist (so
     ///   "exists, foreign tenant" is the only path that returns `Forbidden`).
-    /// - Returns [`GateError::Forbidden`] if the caller cannot write.
+    /// - Returns [`GateError::Unauthenticated`] for anonymous callers,
+    ///   [`GateError::Forbidden`] for cross-tenant writes
+    ///   ([`plexus_auth_core_ut1::TenantGate::authorize_write_of`]).
     /// - **Preserves** the existing facet's `meta.extra["tenant"]` value
     ///   even if the supplied `facet` mutates it. This is the structural fix
-    ///   for the "tenant hop via update" attack.
+    ///   for the "tenant hop via update" attack (threat-model item 4's
+    ///   update-preserve half — backend-side data plumbing, per the UT-1
+    ///   adapter contract).
     pub async fn update(&self, mut facet: Facet) -> Result<Facet, GateError> {
         let existing = match self.store.get_facet(facet.id).await {
             Ok(f) => f,
             Err(StoreError::NotFound(_)) => return Err(GateError::NotFound),
             Err(e) => return Err(GateError::Store(e)),
         };
-        if !self.can_write(&existing) {
-            return Err(GateError::Forbidden);
-        }
+        self.gate.authorize_write_of(&existing)?;
         // Preserve the existing tenant assignment regardless of what the
         // caller put in `facet.meta.extra["tenant"]`. The tenant attribute
         // is structural metadata, not a user-editable field.
-        match Self::facet_tenant_str(&existing) {
+        match existing.meta.extra.get("tenant").and_then(|v| v.as_str()) {
             Some(t) => {
                 facet.meta.extra.insert(
                     "tenant".to_string(),
@@ -272,7 +279,8 @@ impl TenantGate {
 
     /// Delete a facet.
     ///
-    /// Returns [`GateError::NotFound`] for a missing target; returns
+    /// Returns [`GateError::NotFound`] for a missing target;
+    /// [`GateError::Unauthenticated`] for anonymous callers;
     /// [`GateError::Forbidden`] if the caller cannot write to an existing
     /// foreign-tenant facet.
     pub async fn delete(&self, id: Uuid) -> Result<(), GateError> {
@@ -281,9 +289,7 @@ impl TenantGate {
             Err(StoreError::NotFound(_)) => return Err(GateError::NotFound),
             Err(e) => return Err(GateError::Store(e)),
         };
-        if !self.can_write(&existing) {
-            return Err(GateError::Forbidden);
-        }
+        self.gate.authorize_write_of(&existing)?;
         self.store.delete_facet(id).await?;
         Ok(())
     }
@@ -291,20 +297,20 @@ impl TenantGate {
     /// List children of a parent, filtering out facets the caller cannot see.
     ///
     /// **Performance caveat:** filtering happens after the store query so a
-    /// caller still pays the I/O cost of foreign-tenant rows. Acceptable for
-    /// the demo; a real impl needs push-down filtering (parameterized
-    /// `tenant_id` SQL predicate). Tracked under AUTHZ-DATA-2-MACRO.
+    /// caller still pays the I/O cost of foreign-tenant rows. Push-down
+    /// filtering (parameterized `tenant_id` SQL predicate) is tracked under
+    /// AUTHZ-DATA-2-MACRO.
     pub async fn list_children(
         &self,
         parent: Option<Uuid>,
     ) -> Result<Vec<Facet>, GateError> {
         let all = self.store.list_children(parent).await?;
-        Ok(all.into_iter().filter(|f| self.can_see(f)).collect())
+        Ok(all.into_iter().filter(|f| self.gate.visible(f)).collect())
     }
 
     // ─── Read paths (visibility-filtered) ────────────────────────────────
 
-    /// Walk the subtree rooted at `id`, filtering every node by `can_see`.
+    /// Walk the subtree rooted at `id`, filtering every node by visibility.
     ///
     /// If the root itself is not visible to the caller, returns an empty
     /// vec — this avoids leaking "the root exists but its children are
@@ -323,20 +329,20 @@ impl TenantGate {
         let nodes = self.store.get_subtree(id).await?;
         Ok(nodes
             .into_iter()
-            .filter(|(f, _)| self.can_see(f))
+            .filter(|(f, _)| self.gate.visible(f))
             .collect())
     }
 
     /// Full-text search delegating to [`FacetStore::search`], then filtering
     /// matches the caller cannot see.
     ///
-    /// As with `list_children`, filtering is post-query for the demo;
-    /// push-down to the FTS5 join is follow-up work.
+    /// As with `list_children`, filtering is post-query; push-down to the
+    /// FTS5 join is follow-up work.
     pub async fn search(&self, query: &str) -> Result<Vec<(Facet, f64)>, GateError> {
         let results = self.store.search(query).await?;
         Ok(results
             .into_iter()
-            .filter(|(f, _)| self.can_see(f))
+            .filter(|(f, _)| self.gate.visible(f))
             .collect())
     }
 
@@ -351,21 +357,19 @@ impl TenantGate {
         let roots = self.store.list_roots().await?;
         let mut all = Vec::new();
         for root in roots {
-            if self.can_see(&root) {
+            if self.gate.visible(&root) {
                 let root_id = root.id;
                 all.push(root);
                 if let Ok(children) = self.store.get_subtree(root_id).await {
                     for (f, _depth) in children {
-                        if self.can_see(&f) {
+                        if self.gate.visible(&f) {
                             all.push(f);
                         }
                     }
                 }
             }
-            // If the root is invisible the entire subtree is invisible
-            // too (a child of an invisible root cannot have a visible
-            // tenant tag and remain reachable to a foreign tenant —
-            // currently subtrees mix freely, so we conservatively skip).
+            // If the root is invisible the entire subtree is skipped
+            // conservatively (subtrees mix freely today).
         }
         Ok(all)
     }
@@ -392,16 +396,13 @@ impl TenantGate {
         let mut keep = Vec::with_capacity(edges.len());
         for edge in edges {
             // Both endpoints must be visible. Fetch the far endpoint.
-            // Implementation note: the focal endpoint is already visible
-            // (we just fetched it), but we still re-check `can_see` on the
-            // far facet via the gate to keep the rule symmetrical.
             let far_id = if edge.from_id == id {
                 edge.to_id
             } else {
                 edge.from_id
             };
             match self.store.get_facet(far_id).await {
-                Ok(far) if self.can_see(&far) => keep.push(edge),
+                Ok(far) if self.gate.visible(&far) => keep.push(edge),
                 _ => {
                     // Far endpoint missing or invisible — drop the edge.
                 }
@@ -414,12 +415,9 @@ impl TenantGate {
     /// targets whose far-endpoint is visible and not `done`. Returns
     /// `(facet, blocker_ids)` pairs for facets that actually have blockers.
     ///
-    /// This is purpose-built for the `blocked` handler — keeping the join
-    /// logic alongside the gate so the foreign-tenant filter is enforced
-    /// uniformly. A blocker that lives in a foreign tenant is treated as
-    /// "not a blocker" — but it's also not surfaced via this listing,
-    /// which is the correct behavior: from the caller's POV the blocker
-    /// does not exist.
+    /// A blocker that lives in a foreign tenant is treated as "not a
+    /// blocker" — from the caller's POV the blocker does not exist
+    /// (confirming it would leak schedule signal across the boundary).
     pub async fn blocked_in(
         &self,
         parent: Option<Uuid>,
@@ -438,15 +436,12 @@ impl TenantGate {
             let mut blockers = Vec::new();
             for dep in &deps {
                 match self.store.get_facet(dep.to_id).await {
-                    Ok(target) if self.can_see(&target) && target.status != "done" => {
+                    Ok(target) if self.gate.visible(&target) && target.status != "done" => {
                         blockers.push(dep.to_id);
                     }
                     _ => {
                         // Target missing or invisible — not a blocker for
-                        // this caller. Cross-tenant blockers are also
-                        // hidden, even when they exist and are non-done,
-                        // because confirming their existence would leak
-                        // schedule signal across the tenant boundary.
+                        // this caller.
                     }
                 }
             }
@@ -460,18 +455,18 @@ impl TenantGate {
     // ─── Write paths (auth-required, write-predicate enforced) ───────────
 
     /// Add an edge between `from` and `to`. Requires the caller to have
-    /// write access to BOTH endpoints. Returns `Forbidden` (not
-    /// `NotFound`) when either endpoint is foreign — write paths already
-    /// concede existence via the corresponding `create` calls.
+    /// write access to BOTH endpoints. Anonymous callers receive
+    /// [`GateError::Unauthenticated`] before any store I/O; cross-tenant
+    /// endpoints yield [`GateError::Forbidden`] (write paths already
+    /// concede existence via the corresponding `create` calls).
     pub async fn add_edge(&self, edge: Edge) -> Result<Edge, GateError> {
-        if self.tenant.is_none() {
+        if self.gate.is_anonymous() {
             return Err(GateError::Unauthenticated);
         }
         let from = self.store.get_facet(edge.from_id).await?;
         let to = self.store.get_facet(edge.to_id).await?;
-        if !self.can_write(&from) || !self.can_write(&to) {
-            return Err(GateError::Forbidden);
-        }
+        self.gate.authorize_write_of(&from)?;
+        self.gate.authorize_write_of(&to)?;
         self.store.add_edge(&edge).await?;
         Ok(edge)
     }
@@ -484,14 +479,13 @@ impl TenantGate {
         to_id: Uuid,
         kind: &EdgeKind,
     ) -> Result<(), GateError> {
-        if self.tenant.is_none() {
+        if self.gate.is_anonymous() {
             return Err(GateError::Unauthenticated);
         }
         let from = self.store.get_facet(from_id).await?;
         let to = self.store.get_facet(to_id).await?;
-        if !self.can_write(&from) || !self.can_write(&to) {
-            return Err(GateError::Forbidden);
-        }
+        self.gate.authorize_write_of(&from)?;
+        self.gate.authorize_write_of(&to)?;
         self.store.remove_edge(from_id, to_id, kind).await?;
         Ok(())
     }
@@ -509,7 +503,7 @@ impl TenantGate {
         id: Uuid,
         new_parent: Option<Uuid>,
     ) -> Result<Option<Uuid>, GateError> {
-        if self.tenant.is_none() {
+        if self.gate.is_anonymous() {
             return Err(GateError::Unauthenticated);
         }
         let source = match self.store.get_facet(id).await {
@@ -517,18 +511,14 @@ impl TenantGate {
             Err(StoreError::NotFound(_)) => return Err(GateError::NotFound),
             Err(e) => return Err(GateError::Store(e)),
         };
-        if !self.can_write(&source) {
-            return Err(GateError::Forbidden);
-        }
+        self.gate.authorize_write_of(&source)?;
         if let Some(parent_id) = new_parent {
             let parent = match self.store.get_facet(parent_id).await {
                 Ok(f) => f,
                 Err(StoreError::NotFound(_)) => return Err(GateError::NotFound),
                 Err(e) => return Err(GateError::Store(e)),
             };
-            if !self.can_write(&parent) {
-                return Err(GateError::Forbidden);
-            }
+            self.gate.authorize_write_of(&parent)?;
         }
         let old_parent = source.parent_id;
         self.store.move_facet(id, new_parent).await?;
@@ -538,7 +528,8 @@ impl TenantGate {
 
 #[cfg(test)]
 mod tests {
-    //! In-module sanity tests for the gate predicates. End-to-end pentest
+    //! In-module sanity tests for the gate predicates (now delegated to the
+    //! generalized `plexus_auth_core_ut1::TenantGate`). End-to-end pentest
     //! coverage lives in `tests/tenant_isolation_test.rs`.
 
     use super::*;
@@ -546,9 +537,21 @@ mod tests {
     use chrono::Utc;
     use serde_json::{json, Value};
 
-    /// Compose an `AuthContext` carrying a `tenant_id` claim. Helper for
-    /// pentest setup; mirrors what the JWT validator emits in production.
+    /// Compose an `AuthContext` carrying an `org_id` claim — what the
+    /// UT-W3 OIDC validator emits in production (it also writes the
+    /// `tenant_id` deprecation alias; the resolver reads either).
     fn ctx_with_tenant(user: &str, tenant: &str) -> AuthContext {
+        AuthContext::new(
+            user.to_string(),
+            "sess-1".to_string(),
+            vec![],
+            json!({"org_id": tenant}),
+        )
+    }
+
+    /// Legacy-claim context: only `tenant_id` (the pre-cutover shape).
+    /// Pinned to keep resolving during the UT-S01 D3 deprecation window.
+    fn ctx_with_legacy_tenant(user: &str, tenant: &str) -> AuthContext {
         AuthContext::new(
             user.to_string(),
             "sess-1".to_string(),
@@ -558,15 +561,14 @@ mod tests {
     }
 
     /// Empty session_id is the canonical "not authenticated" signal per
-    /// `AuthContext::is_authenticated`. The resolver's
-    /// `single_user_fallback` branch is gated on `is_authenticated()`, so
-    /// this shape resolves to None even though the claim is present.
+    /// `AuthContext::is_authenticated`. The generalized gate rejects this
+    /// shape even when a tenancy claim is present.
     fn ctx_forged(user: &str, tenant: &str) -> AuthContext {
         AuthContext::new(
             user.to_string(),
             String::new(), // empty session → !is_authenticated
             vec![],
-            json!({"tenant_id": tenant}),
+            json!({"org_id": tenant}),
         )
     }
 
@@ -591,10 +593,8 @@ mod tests {
         }
     }
 
-    /// Standalone predicate tests do not need a real store; we use a Null
-    /// store stand-in by going through the constructor's tenant-only path
-    /// with a no-op store. Because the predicate methods do not touch the
-    /// store, we can use a stub.
+    /// Standalone predicate tests do not need a real store; the predicate
+    /// methods never touch it, so a panicking stub suffices.
     #[derive(Default)]
     struct NoopStore;
 
@@ -688,6 +688,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_tenant_id_claim_still_resolves() {
+        // UT-S01 D3 deprecation window: contexts carrying only the legacy
+        // `tenant_id` key (pre-cutover validators) keep resolving.
+        let ctx = ctx_with_legacy_tenant("alice", "acme");
+        let gate = TenantGate::from_auth(noop(), Some(&ctx)).await;
+        assert_eq!(gate.caller_tenant().map(|t| t.as_str()), Some("acme"));
+    }
+
+    #[tokio::test]
     async fn anonymous_cannot_write_anything() {
         let gate = TenantGate::from_auth(noop(), None).await;
         assert!(!gate.can_write(&facet_in_tenant(None)));
@@ -705,7 +714,7 @@ mod tests {
 
     #[tokio::test]
     async fn forged_unauthenticated_context_resolves_to_anonymous() {
-        // No claim + empty session_id → gate.tenant = None.
+        // No claim + empty session_id → gate is anonymous.
         let ctx = AuthContext::new(
             "alice".into(),
             String::new(), // empty session
@@ -718,23 +727,47 @@ mod tests {
 
     #[tokio::test]
     async fn forged_ctx_with_claim_but_no_session_is_rejected_by_gate() {
-        // tenant_id claim present, but empty session_id.
-        //
-        // FINDING: ClaimTenantResolver itself does NOT check
-        // is_authenticated() before honoring a tenant_id claim — it trusts
-        // the AuthContext as post-SessionValidator. That leaves a gap when
-        // an upstream layer (or a test) constructs an AuthContext directly
-        // without going through the validator.
-        //
-        // The gate closes the gap as defense-in-depth: `from_auth` rejects
-        // any AuthContext where `is_authenticated() == false`. Even if a
-        // caller fabricates `{"tenant_id": "acme"}` with empty session_id,
-        // the gate treats them as anonymous.
+        // org_id claim present, but empty session_id. The generalized
+        // gate's from_auth rejects any AuthContext where
+        // `is_authenticated() == false` — the layered defense the trak
+        // reference pinned and UT-1 extracted verbatim.
         let ctx = ctx_forged("alice", "acme");
         let gate = TenantGate::from_auth(noop(), Some(&ctx)).await;
         assert!(
             gate.caller_tenant().is_none(),
-            "gate must reject unauthenticated AuthContext even if it carries a tenant_id claim"
+            "gate must reject unauthenticated AuthContext even if it carries a tenancy claim"
         );
+    }
+
+    #[tokio::test]
+    async fn corrupt_tenant_tag_is_not_public() {
+        // A stored tag that fails TenantId validation must NOT collapse to
+        // "public" (per the TenantTagged contract) — it maps to the
+        // sentinel, which no caller's resolved tenant can equal.
+        let mut meta = FacetMeta::default();
+        meta.extra.insert(
+            "tenant".to_string(),
+            Value::String("evil\u{0000}tenant".to_string()),
+        );
+        let now = Utc::now();
+        let corrupt = Facet {
+            id: Uuid::new_v4(),
+            parent_id: None,
+            title: "corrupt".to_string(),
+            body: None,
+            status: "open".to_string(),
+            owner: "anyone".to_string(),
+            meta,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let anon = TenantGate::from_auth(noop(), None).await;
+        assert!(!anon.can_see(&corrupt), "corrupt tag must not become public");
+
+        let ctx = ctx_with_tenant("alice", "acme");
+        let gate = TenantGate::from_auth(noop(), Some(&ctx)).await;
+        assert!(!gate.can_see(&corrupt));
+        assert!(!gate.can_write(&corrupt));
     }
 }

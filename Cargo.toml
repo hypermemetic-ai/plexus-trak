@@ -30,21 +30,41 @@ plexus-core = { path = "../plexus-core", version = "0.5" }
 # dep graph, which makes `DynamicHub: Activation` fail to satisfy.
 #
 # `plexus-macros` is pinned at the SAME physical path that plexus-core
-# uses. Multiple in-flight macros worktrees exist (each disambiguated
-# by a pre-release version tag); the workspace `plexus-core/Cargo.toml`
-# currently points at `plexus-macros-AUTHZ-MACRO-OPTIONAL-AUTH-1`,
-# which carries the AUTHZ-MACRO-OPTIONAL-AUTH-1 codegen fix
-# (`Option<&AuthContext>` pass-through). We align to the same physical
-# path so cargo sees one `plexus-macros` package id; the matching
-# `version` requirement is loose so a future bump on either side stays
-# compatible.
-plexus-macros = { path = "../plexus-macros-AUTHZ-MACRO-OPTIONAL-AUTH-1" }
+# uses so cargo sees one `plexus-macros` package id. The
+# AUTHZ-MACRO-OPTIONAL-AUTH-1 worktree has since merged back into the
+# canonical `../plexus-macros` checkout (which plexus-core/Cargo.toml
+# points at today), so we follow it there. The codegen behavior it
+# carried (`Option<&AuthContext>` pass-through; `auth: &AuthContext`
+# fail-closed to Unauthenticated at dispatch) is present.
+plexus-macros = { path = "../plexus-macros" }
 plexus-transport = { path = "../plexus-transport", version = "0.3" }
 
-# Sealed auth primitives (Tenant, ClaimTenantResolver, AuthContext).
-# Path dep so the AuthContext type used in trak handlers is identical to the
-# one expected by `ClaimTenantResolver::resolve`.
+# Sealed auth primitives (AuthContext re-export target, schema marker
+# machinery the `plexus_macros::activation` codegen references by the
+# literal path `plexus_auth_core::...`). MUST stay the same package id
+# plexus-core uses, or every macro expansion in this crate type-errors.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.1" }
+
+# UT-1 primitives: the generalized TenantGate (predicates / GateDenial /
+# TenantTagged), the org_id-default ClaimTenantResolver, and the OIDC
+# validator (`oidc::OidcSessionValidator` / `oidc::OidcValidator`) — from
+# the UNMERGED feature/UT-1-tenancy-oidc branch, via the local shim crate
+# (see ut1-auth-core/Cargo.toml for the full why: cargo lockfile collision
+# rules out a second path dep; a renamed direct dep breaks the
+# `plexus_macros::activation` codegen's proc-macro-crate resolution).
+#
+# ████████████████████████████████████████████████████████████████████████
+# TODO: repoint to ../plexus-auth-core once feature/UT-1-tenancy-oidc
+# merges — delete this dep + the ut1-auth-core/ shim crate, and
+# s/plexus_auth_core_ut1/plexus_auth_core/ across src/ + tests/. Also
+# delete the UT-W3-MIRROR shims (grep "UT-W3-MIRROR" in src/auth.rs /
+# src/tenant_gate.rs).
+# ████████████████████████████████████████████████████████████████████████
+#
+# CONSEQUENCE while unmerged: `plexus_core::plexus::AuthContext` is NOT the
+# same nominal type as `plexus_auth_core_ut1::AuthContext`. The
+# field-for-field mirror shims (grep "UT-W3-MIRROR") bridge the two.
+plexus-auth-core-ut1 = { path = "ut1-auth-core", version = "0.1" }
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -58,6 +78,10 @@ serde_json = "1"
 
 # Regex
 regex = "1"
+
+# OIDC issuer URLs (UT-W3): same `url 2` the auth-core crates pin, so
+# `url::Url` unifies with `IssuerUrl::try_new`'s parameter type.
+url = "2"
 
 # IDs + time
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -76,7 +100,9 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 thiserror = "2"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+# `env` (UT-W3): --oidc-issuer / --oidc-audience read TRAK_OIDC_ISSUER /
+# TRAK_OIDC_AUDIENCE when the flags are absent.
+clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 anyhow = "1"
 

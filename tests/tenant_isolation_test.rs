@@ -241,22 +241,22 @@ async fn anonymous_cannot_write() {
     mutated.title = "pwnd".into();
     let err = anon_gate.update(mutated).await.unwrap_err();
     assert!(
-        matches!(err, GateError::Forbidden),
-        "anonymous update must be denied, got {err:?}"
+        matches!(err, GateError::Unauthenticated),
+        "anonymous update must be Unauthenticated, got {err:?}"
     );
-    // FINDING: anon writes surface as Forbidden (not Unauthenticated)
-    // because the gate's can_write() returns false for caller=None across
-    // the board. The control-flow is "auth check happens inside can_write".
-    // Functionally identical from the attacker's POV: the operation fails.
-    // We could surface Unauthenticated specifically by early-returning in
-    // update/delete when self.tenant.is_none(); leaving as Forbidden is
-    // consistent with how can_write encodes "no caller → no writes".
+    // UT-W3 NOTE: pre-adapter, anon update/delete surfaced as Forbidden
+    // (the auth check lived inside can_write) and this test carried a
+    // FINDING that Unauthenticated would be the more precise signal. The
+    // generalized gate's `authorize_write_of` (UT-1) implements exactly
+    // that split: anonymous → Unauthenticated, authenticated-but-foreign
+    // → Forbidden. Functionally identical from the attacker's POV; the
+    // assertion is upgraded to the precise signal.
 
     // delete
     let err = anon_gate.delete(target.id).await.unwrap_err();
     assert!(
-        matches!(err, GateError::Forbidden),
-        "anonymous delete must be denied, got {err:?}"
+        matches!(err, GateError::Unauthenticated),
+        "anonymous delete must be Unauthenticated, got {err:?}"
     );
 }
 

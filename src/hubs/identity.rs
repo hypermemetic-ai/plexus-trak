@@ -18,6 +18,13 @@ use crate::store::identity::{
 };
 
 /// JWT claims for access tokens.
+///
+/// DEPRECATED (UT-W3): this is the legacy HS256 claim shape (`tenant`, no
+/// `iss`/`aud`/`kid`). The trak validator no longer accepts tokens minted
+/// with it — session validation is OIDC-only (RS256 via the configured
+/// issuer's JWKS) plus the API-key fallback. The whole IdentityHub is
+/// superseded by plexus-idp (UT-2) and slated for removal; it is kept
+/// compiling so existing register/API-key flows survive until that step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -52,7 +59,20 @@ impl IdentityHub {
     }
 
     /// Issue an access token JWT for the given user.
+    ///
+    /// DEPRECATED (UT-W3 / 74103adf): mints an HS256 shared-secret token
+    /// that **this daemon's own validator no longer accepts** (`TrakAuth`
+    /// validates OIDC RS256 + API keys only; no dual-accept window per
+    /// UT-S01 D4). Login against plexus-idp instead (`identity.login` on
+    /// the IdP, or `POST {issuer}/oauth/token`). Kept compiling pending
+    /// the full IdentityHub removal.
     fn issue_access_token(&self, user: &UserRecord) -> Result<(String, u64), String> {
+        tracing::warn!(
+            target: "plexus::auth",
+            user_id = %user.id,
+            "DEPRECATED HS256 mint path (identity.login/refresh): the issued \
+             token will NOT validate against this daemon — use plexus-idp"
+        );
         let now = Utc::now();
         let exp = now + Duration::seconds(ACCESS_TOKEN_TTL_SECS);
 
@@ -76,8 +96,18 @@ impl IdentityHub {
     }
 
     /// Issue a JWT for an SRP identity. Uses the same `Claims` shape as
-    /// password-based login so `TrakAuth::try_jwt` accepts both transparently.
+    /// password-based login.
+    ///
+    /// DEPRECATED (UT-W3 / 74103adf): same as [`Self::issue_access_token`]
+    /// — the minted HS256 token is no longer accepted by `TrakAuth`. SRP's
+    /// future is UT-S01 open question Q5.
     fn issue_srp_access_token(&self, identity: &SrpIdentity) -> Result<(String, u64), String> {
+        tracing::warn!(
+            target: "plexus::auth",
+            identity_id = %identity.id,
+            "DEPRECATED HS256 mint path (identity.srp_verify): the issued \
+             token will NOT validate against this daemon — use plexus-idp"
+        );
         let now = Utc::now();
         let exp = now + Duration::seconds(ACCESS_TOKEN_TTL_SECS);
 

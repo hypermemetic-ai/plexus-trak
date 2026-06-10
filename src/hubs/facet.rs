@@ -179,22 +179,25 @@ impl FacetHub {
     /// **AUTHZ-TENANT-GATE note:** routed through `TenantGate::get`, which
     /// returns `NotFound` for both "does not exist" and "exists but in
     /// foreign tenant". The conflation is intentional (existence-oracle
-    /// defense). Ideally this handler would accept `auth: Option<&AuthContext>`
-    /// so anonymous callers could still read public facets; the
-    /// `plexus-macros::method` codegen unwraps `Option<&AuthContext>` to
-    /// `&AuthContext` regardless of the declared shape (see RUN-NOTES under
-    /// "macro doesn't support optional auth"). Until that is fixed,
-    /// `get` is forced-auth here.
+    /// defense).
+    ///
+    /// **Read posture (UT-W3, per defect 88f9bcb6):** reads are
+    /// anonymous-tolerant — `auth: Option<&AuthContext>` so anonymous
+    /// callers can read PUBLIC (untenanted) facets; tenant-owned facets
+    /// remain invisible to them via the gate. All mutating methods on this
+    /// hub are forced-auth (`auth: &AuthContext` fail-closes at dispatch).
+    /// Uses the AUTHZ-MACRO-OPTIONAL-AUTH-1 `Option<&AuthContext>`
+    /// pass-through codegen.
     #[plexus_macros::method(
         description = "Retrieve a single facet by UUID (visibility scoped to caller's tenant)",
         params(id = "Facet UUID")
     )]
     async fn get(
         &self,
-        auth: &AuthContext,
+        auth: Option<&AuthContext>,
         id: String,
     ) -> impl Stream<Item = TrakEvent> + Send + 'static {
-        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
+        let gate = TenantGate::from_auth(self.store.clone(), auth).await;
         stream! {
             let uuid = match uuid::Uuid::parse_str(&id) {
                 Ok(u) => u,
@@ -423,7 +426,7 @@ impl FacetHub {
     )]
     async fn list(
         &self,
-        auth: &AuthContext,
+        auth: Option<&AuthContext>,
         parent_id: Option<String>,
         tags: Option<Vec<String>>,
         tags_all: Option<Vec<String>>,
@@ -433,7 +436,11 @@ impl FacetHub {
         // facets are filtered out via `TenantGate::list_children`. The
         // tag/priority post-filter runs on the already-visibility-scoped
         // set so callers don't see "ghost" totals.
-        let gate = TenantGate::from_auth(self.store.clone(), Some(auth)).await;
+        //
+        // UT-W3 read posture (defect 88f9bcb6): anonymous-tolerant like the
+        // other read paths (tree/links/blocked/search/grep) — anonymous
+        // callers see only PUBLIC facets.
+        let gate = TenantGate::from_auth(self.store.clone(), auth).await;
         let store = self.store.clone();
         stream! {
             let parent_uuid = match parent_id.as_deref().map(uuid::Uuid::parse_str).transpose() {

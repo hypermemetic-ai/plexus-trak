@@ -1,0 +1,50 @@
+[package]
+# UT-W3 shim: re-exports the UNMERGED UT-1 branch of plexus-auth-core under
+# a distinct PACKAGE name.
+#
+# ████████████████████████████████████████████████████████████████████████
+# TODO: repoint to ../plexus-auth-core once feature/UT-1-tenancy-oidc
+# merges — i.e. DELETE this whole shim crate, drop the
+# `plexus-auth-core-ut1` dep from ../Cargo.toml, and
+# s/plexus_auth_core_ut1/plexus_auth_core/ across ../src + ../tests.
+# ████████████████████████████████████████████████████████████████████████
+#
+# Why a shim instead of a direct dep in plexus-trak/Cargo.toml:
+#
+# 1. A literal `path = "../plexus-auth-core-UT1"` dep is impossible —
+#    plexus-core path-deps the pre-UT-1 `../plexus-auth-core`, and cargo
+#    refuses two path packages with identical name+version in one lockfile
+#    ("package collision in the lockfile").
+# 2. A renamed direct dep (`plexus-auth-core-ut1 = { package =
+#    "plexus-auth-core", git = ... }`) breaks every
+#    `#[plexus_macros::activation]` expansion: the macro resolves
+#    `proc_macro_crate::crate_name("plexus-auth-core")` against the
+#    consuming crate's manifest, finds the renamed UT-1 dep, and emits the
+#    UT-1 crate's `CredentialFieldMarker`/`CredentialIssuer` into call
+#    sites that plexus-core's `CredentialFieldDecl::from_marker` (built
+#    against the OLD crate) must accept — E0308 across all eight hubs.
+#
+# This shim keeps plexus-trak's manifest with exactly ONE dependency whose
+# package name is "plexus-auth-core" (the old one, for the macro), while
+# the UT-1 surface arrives under the unambiguous package name
+# "plexus-auth-core-ut1" / extern name `plexus_auth_core_ut1`.
+#
+# The git source points at the SAME repository/branch/commit the
+# ../plexus-auth-core-UT1 worktree has checked out (feature/UT-1-tenancy-oidc,
+# d5688c7) — git sources are disambiguated in the lockfile, so the old and
+# UT-1 crates coexist.
+name = "plexus-auth-core-ut1"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "UT-W3 shim over the unmerged feature/UT-1-tenancy-oidc branch of plexus-auth-core"
+
+[lib]
+name = "plexus_auth_core_ut1"
+path = "src/lib.rs"
+
+[dependencies]
+# `oidc-reqwest` enables the batteries-included discovery/JWKS HTTP fetcher
+# (`oidc::ReqwestJwksFetcher`) used by the production validator wired in
+# plexus-trak's src/bin/main.rs.
+plexus-auth-core = { git = "file:///Users/shmendez/dev/controlflow/hypermemetic/plexus-auth-core", branch = "feature/UT-1-tenancy-oidc", features = ["oidc-reqwest"] }

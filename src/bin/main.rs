@@ -30,6 +30,17 @@ struct Args {
     /// Path to SQLite database
     #[arg(long)]
     db: Option<String>,
+
+    /// Trusted OIDC issuer URL (plexus-idp or any compliant IdP, e.g. a
+    /// real Auth0 tenant). Tokens are validated locally against the
+    /// issuer's published JWKS — no shared secrets (UT-S01 D1).
+    #[arg(long, env = "TRAK_OIDC_ISSUER", default_value = plexus_trak::auth::DEFAULT_OIDC_ISSUER)]
+    oidc_issuer: String,
+
+    /// Expected token audience (per-backend API identifier; a token
+    /// minted for another backend must not replay here).
+    #[arg(long, env = "TRAK_OIDC_AUDIENCE", default_value = plexus_trak::auth::DEFAULT_OIDC_AUDIENCE)]
+    oidc_audience: String,
 }
 
 fn default_db_path() -> String {
@@ -47,6 +58,12 @@ fn default_config_dir() -> PathBuf {
 }
 
 /// Load or generate the JWT secret key.
+///
+/// DEPRECATED (UT-W3 / 74103adf): this secret feeds ONLY the IdentityHub's
+/// HS256 *mint* paths, which are themselves deprecated pending the
+/// IdentityHub → plexus-idp removal. `TrakAuth` no longer reads it —
+/// tokens minted with it are NOT accepted by this daemon. The post-deploy
+/// runbook step deletes the file outright.
 fn load_or_create_jwt_secret(config_dir: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     let secret_path = config_dir.join("jwt_secret");
     if secret_path.exists() {
@@ -92,7 +109,17 @@ async fn main() -> anyhow::Result<()> {
     let discuss_store = Arc::new(DiscussStore::new(store.pool().clone()));
     discuss_store.migrate().await?;
 
-    let trak_auth = Arc::new(TrakAuth::new(identity_store.clone(), jwt_secret.clone()));
+    // UT-W3: session validation is OIDC (RS256 against the issuer's JWKS,
+    // discovery-resolved, AUTH-8 caching) + the unchanged API-key fallback.
+    // The HS256 shared-secret validation path is gone (closes 74103adf).
+    let oidc_config =
+        plexus_trak::auth::oidc_config(&args.oidc_issuer, &args.oidc_audience)?;
+    tracing::info!(
+        issuer = %args.oidc_issuer,
+        audience = %args.oidc_audience,
+        "OIDC session validation enabled (RS256 via issuer JWKS; HS256 path removed)"
+    );
+    let trak_auth = Arc::new(TrakAuth::new(identity_store.clone(), oidc_config));
 
     let hub = Arc::new(
         DynamicHub::new("trak")

@@ -1,8 +1,10 @@
+mod common;
+
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
-use plexus_trak::auth::TrakAuth;
 use plexus_trak::store::identity::{ApiKeyRecord, IdentityStore, RefreshTokenRecord, UserRecord};
 use plexus_trak::store::sqlite::SqliteStore;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -10,11 +12,13 @@ use argon2::password_hash::{PasswordHasher, SaltString};
 use argon2::password_hash::rand_core::OsRng;
 use argon2::Argon2;
 
-// Re-use the Claims struct from the identity hub
+// The LEGACY HS256 claim shape (mirrors the deprecated
+// `plexus_trak::hubs::identity::Claims`) — kept here solely to mint
+// old-world tokens and assert the UT-W3 validator REJECTS them.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Claims {
+struct LegacyClaims {
     sub: String,
     username: String,
     roles: Vec<String>,
@@ -301,106 +305,121 @@ async fn test_refresh_token_delete() {
     assert!(found.is_none());
 }
 
-// ── TrakAuth (JWT + API key validation) ────────────────────────────
+// ── TrakAuth (UT-W3: OIDC + API key validation) ────────────────────
+//
+// The HS256 path is GONE (issue 74103adf / UT-S01 D4 step 3). These
+// tests pin the new contract: RS256 OIDC tokens against the configured
+// issuer's JWKS validate; legacy HS256 tokens (even ones minted by the
+// deprecated IdentityHub paths) do NOT; the API-key fallback is
+// unchanged. Fixtures come from tests/common (no network).
+
+use plexus_core::plexus::SessionValidator;
 
 #[tokio::test]
-async fn test_jwt_validation() {
+async fn test_oidc_token_round_trip() {
     let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"test-jwt-secret-key".to_vec();
-    let auth = TrakAuth::new(id_store, secret.clone());
+    let auth = common::fixture_trak_auth(id_store);
 
-    let now = Utc::now();
-    let claims = Claims {
-        sub: "user-123".to_string(),
-        username: "testuser".to_string(),
-        roles: vec!["user".to_string()],
-        tenant: None,
-        exp: (now + Duration::hours(1)).timestamp() as usize,
-        iat: now.timestamp() as usize,
-    };
+    let token = common::mint_for("user-123", Some("org_acme"));
+    let ctx = auth.validate(&token).await.expect("valid RS256 token must authenticate");
 
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(&secret),
-    )
-    .unwrap();
-
-    use plexus_core::plexus::SessionValidator;
-    let ctx = auth.validate(&token).await;
-    assert!(ctx.is_some(), "valid JWT should authenticate");
-
-    let ctx = ctx.unwrap();
     assert_eq!(ctx.user_id, "user-123");
+    assert!(ctx.has_role("user"));
+    // UT-S01 D3 dual-key window: org_id AND the tenant_id alias.
+    assert_eq!(ctx.get_metadata_string("org_id").as_deref(), Some("org_acme"));
+    assert_eq!(ctx.get_metadata_string("tenant_id").as_deref(), Some("org_acme"));
+    assert_eq!(ctx.get_metadata_string("auth_method").as_deref(), Some("oidc"));
+    // The session_id quirk fix (UT-W3 deliverable 4): token-authed
+    // contexts are *authenticated* — non-empty session id.
+    assert!(!ctx.session_id.is_empty());
+    assert!(ctx.is_authenticated());
 }
 
 #[tokio::test]
-async fn test_jwt_expired() {
+async fn test_legacy_hs256_token_rejected() {
+    // The 74103adf forgery shape: an HS256 token signed with a local
+    // shared secret. Pre-UT-W3 this validated; now it must NOT — there
+    // is no dual-accept window (UT-S01 D4).
     let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"test-jwt-secret-key".to_vec();
-    let auth = TrakAuth::new(id_store, secret.clone());
+    let auth = common::fixture_trak_auth(id_store);
 
     let now = Utc::now();
-    let claims = Claims {
-        sub: "user-456".to_string(),
-        username: "expired_user".to_string(),
-        roles: vec!["user".to_string()],
-        tenant: None,
-        exp: (now - Duration::hours(1)).timestamp() as usize, // expired
-        iat: (now - Duration::hours(2)).timestamp() as usize,
-    };
-
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(&secret),
-    )
-    .unwrap();
-
-    use plexus_core::plexus::SessionValidator;
-    let ctx = auth.validate(&token).await;
-    assert!(ctx.is_none(), "expired JWT should not authenticate");
-}
-
-#[tokio::test]
-async fn test_jwt_wrong_secret() {
-    let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"correct-secret".to_vec();
-    let wrong_secret = b"wrong-secret".to_vec();
-    let auth = TrakAuth::new(id_store, secret);
-
-    let now = Utc::now();
-    let claims = Claims {
-        sub: "user-789".to_string(),
-        username: "wrong_secret_user".to_string(),
-        roles: vec!["user".to_string()],
-        tenant: None,
-        exp: (now + Duration::hours(1)).timestamp() as usize,
+    let claims = LegacyClaims {
+        sub: "forged-user".to_string(),
+        username: "admin".to_string(),
+        roles: vec!["admin".to_string(), "superuser".to_string()],
+        tenant: Some("victim-org".to_string()),
+        exp: (now + Duration::days(30)).timestamp() as usize,
         iat: now.timestamp() as usize,
     };
-
     let token = encode(
-        &Header::default(),
+        &Header::default(), // HS256
         &claims,
-        &EncodingKey::from_secret(&wrong_secret),
+        &EncodingKey::from_secret(b"any-local-secret"),
     )
     .unwrap();
 
-    use plexus_core::plexus::SessionValidator;
     let ctx = auth.validate(&token).await;
-    assert!(ctx.is_none(), "JWT with wrong secret should not authenticate");
+    assert!(ctx.is_none(), "HS256 tokens must be rejected post-cutover");
+}
+
+#[tokio::test]
+async fn test_oidc_expired_rejected() {
+    let (_sqlite, id_store, _dir) = temp_stores().await;
+    let auth = common::fixture_trak_auth(id_store);
+
+    let mut c = common::claims();
+    c.insert("exp".into(), json!(common::now() - 10)); // zero leeway
+    let token = common::mint(common::KID_1, common::KEY_1_PEM, c);
+
+    assert!(auth.validate(&token).await.is_none(), "expired token must be rejected");
+}
+
+#[tokio::test]
+async fn test_oidc_wrong_audience_rejected() {
+    // Per-backend audience (UT-S01 D1): a token minted for another
+    // backend must not replay against trak.
+    let (_sqlite, id_store, _dir) = temp_stores().await;
+    let auth = common::fixture_trak_auth(id_store);
+
+    let mut c = common::claims();
+    c.insert("aud".into(), json!("plexus:hyperforge"));
+    let token = common::mint(common::KID_1, common::KEY_1_PEM, c);
+
+    assert!(auth.validate(&token).await.is_none(), "foreign-audience token must be rejected");
+}
+
+#[tokio::test]
+async fn test_oidc_cookie_header_shape() {
+    let (_sqlite, id_store, _dir) = temp_stores().await;
+    let auth = common::fixture_trak_auth(id_store);
+
+    let token = common::mint_for("cookie-user", None);
+    let cookie_header = format!("access_token={token}; other=value");
+
+    let ctx = auth.validate(&cookie_header).await.expect("cookie-wrapped token must authenticate");
+    assert_eq!(ctx.user_id, "cookie-user");
+}
+
+#[tokio::test]
+async fn test_oidc_bare_token_shape() {
+    // synapse `-t <jwt>` sends the bare token.
+    let (_sqlite, id_store, _dir) = temp_stores().await;
+    let auth = common::fixture_trak_auth(id_store);
+
+    let token = common::mint_for("bare-user", None);
+    let ctx = auth.validate(&token).await.expect("bare token must authenticate");
+    assert_eq!(ctx.user_id, "bare-user");
 }
 
 #[tokio::test]
 async fn test_api_key_auth() {
+    // API-key fallback retained unchanged through the cutover.
     let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"jwt-secret".to_vec();
 
-    // Create a user
     let user = make_user("api_user", "pass");
     id_store.create_user(&user).await.unwrap();
 
-    // Create an API key
     let raw_key = "my-raw-api-key-for-testing";
     let key_hash = sha256_hex(raw_key);
     let now = Utc::now();
@@ -415,20 +434,19 @@ async fn test_api_key_auth() {
     };
     id_store.create_api_key(&record).await.unwrap();
 
-    let auth = TrakAuth::new(id_store, secret);
+    let auth = common::fixture_trak_auth(id_store);
 
-    use plexus_core::plexus::SessionValidator;
     let ctx = auth.validate(raw_key).await;
     assert!(ctx.is_some(), "valid API key should authenticate");
 
     let ctx = ctx.unwrap();
     assert_eq!(ctx.user_id, user.id);
+    assert_eq!(ctx.get_metadata_string("auth_method").as_deref(), Some("api_key"));
 }
 
 #[tokio::test]
 async fn test_api_key_expired_rejected() {
     let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"jwt-secret".to_vec();
 
     let user = make_user("exp_user", "pass");
     id_store.create_user(&user).await.unwrap();
@@ -447,112 +465,17 @@ async fn test_api_key_expired_rejected() {
     };
     id_store.create_api_key(&record).await.unwrap();
 
-    let auth = TrakAuth::new(id_store, secret);
+    let auth = common::fixture_trak_auth(id_store);
 
-    use plexus_core::plexus::SessionValidator;
     let ctx = auth.validate(raw_key).await;
     assert!(ctx.is_none(), "expired API key should be rejected");
 }
 
 #[tokio::test]
-async fn test_cookie_parsing() {
-    let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"cookie-secret".to_vec();
-    let auth = TrakAuth::new(id_store, secret.clone());
-
-    let now = Utc::now();
-    let claims = Claims {
-        sub: "cookie-user".to_string(),
-        username: "cookieuser".to_string(),
-        roles: vec!["user".to_string()],
-        tenant: None,
-        exp: (now + Duration::hours(1)).timestamp() as usize,
-        iat: now.timestamp() as usize,
-    };
-
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(&secret),
-    )
-    .unwrap();
-
-    // Wrap in cookie format
-    let cookie_header = format!("access_token={token}; other=value");
-
-    use plexus_core::plexus::SessionValidator;
-    let ctx = auth.validate(&cookie_header).await;
-    assert!(ctx.is_some(), "JWT in cookie header should authenticate");
-    assert_eq!(ctx.unwrap().user_id, "cookie-user");
-}
-
-#[tokio::test]
-async fn test_bare_token() {
-    let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"bare-secret".to_vec();
-    let auth = TrakAuth::new(id_store, secret.clone());
-
-    let now = Utc::now();
-    let claims = Claims {
-        sub: "bare-user".to_string(),
-        username: "bareuser".to_string(),
-        roles: vec!["user".to_string()],
-        tenant: None,
-        exp: (now + Duration::hours(1)).timestamp() as usize,
-        iat: now.timestamp() as usize,
-    };
-
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(&secret),
-    )
-    .unwrap();
-
-    // Pass raw token without cookie prefix
-    use plexus_core::plexus::SessionValidator;
-    let ctx = auth.validate(&token).await;
-    assert!(ctx.is_some(), "bare JWT token should authenticate");
-    assert_eq!(ctx.unwrap().user_id, "bare-user");
-}
-
-#[tokio::test]
-async fn test_jwt_with_tenant() {
-    let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"tenant-secret".to_vec();
-    let auth = TrakAuth::new(id_store, secret.clone());
-
-    let now = Utc::now();
-    let claims = Claims {
-        sub: "tenant-user".to_string(),
-        username: "tenantuser".to_string(),
-        roles: vec!["user".to_string(), "admin".to_string()],
-        tenant: Some("acme-corp".to_string()),
-        exp: (now + Duration::hours(1)).timestamp() as usize,
-        iat: now.timestamp() as usize,
-    };
-
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(&secret),
-    )
-    .unwrap();
-
-    use plexus_core::plexus::SessionValidator;
-    let ctx = auth.validate(&token).await.expect("should validate");
-    assert_eq!(ctx.user_id, "tenant-user");
-    assert!(ctx.has_role("admin"));
-    assert!(ctx.has_role("user"));
-}
-
-#[tokio::test]
 async fn test_invalid_token_string() {
     let (_sqlite, id_store, _dir) = temp_stores().await;
-    let secret = b"secret".to_vec();
-    let auth = TrakAuth::new(id_store, secret);
+    let auth = common::fixture_trak_auth(id_store);
 
-    use plexus_core::plexus::SessionValidator;
     let ctx = auth.validate("not-a-valid-token-or-key").await;
     assert!(ctx.is_none(), "garbage token should return None");
 }

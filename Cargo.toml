@@ -30,15 +30,14 @@ plexus-core = { path = "../plexus-core", version = "0.5" }
 # dep graph, which makes `DynamicHub: Activation` fail to satisfy.
 #
 # `plexus-macros` is pinned at the SAME physical path that plexus-core
-# uses. Multiple in-flight macros worktrees exist (each disambiguated
-# by a pre-release version tag); the workspace `plexus-core/Cargo.toml`
-# currently points at `plexus-macros-AUTHZ-MACRO-OPTIONAL-AUTH-1`,
-# which carries the AUTHZ-MACRO-OPTIONAL-AUTH-1 codegen fix
-# (`Option<&AuthContext>` pass-through). We align to the same physical
-# path so cargo sees one `plexus-macros` package id; the matching
-# `version` requirement is loose so a future bump on either side stays
-# compatible.
-plexus-macros = { path = "../plexus-macros-AUTHZ-MACRO-OPTIONAL-AUTH-1" }
+# uses (`../plexus-macros`), so cargo sees one `plexus-macros` package
+# id. The previous pin pointed at the long-deleted
+# `plexus-macros-AUTHZ-MACRO-OPTIONAL-AUTH-1` worktree (its
+# `Option<&AuthContext>` pass-through fix has since landed in
+# `plexus-macros` proper), which made this crate unbuildable from
+# source (found by R-5 of the ROLES+AP wave; fixed under
+# R-7 2e5058cd-fa96-4d14-bcf6-44f62e204ff0).
+plexus-macros = { path = "../plexus-macros" }
 plexus-transport = { path = "../plexus-transport", version = "0.3" }
 
 # Sealed auth primitives (Tenant, ClaimTenantResolver, AuthContext).

@@ -1,7 +1,7 @@
 //! `TenantGate` — handler-side tenant-isolation wrapper around `FacetStore`.
 //!
 //! **UT-W3 (wave 3): this is now a thin adapter** over the generalized
-//! [`plexus_auth_core_ut1::TenantGate`] extracted by UT-1, exactly per the
+//! [`plexus_auth_core::TenantGate`] extracted by UT-1, exactly per the
 //! adapter shape documented in that module ("Adapter shape: how trak swaps
 //! in"). What remains here is the trak-specific part the extraction
 //! deliberately left behind:
@@ -15,7 +15,7 @@
 //! (read-denial = NotFound existence-oracle defense, write-denial =
 //! Forbidden, anonymous write = Unauthenticated), the `is_authenticated()`
 //! defense-in-depth check, and the create-stamp / update-preserve
-//! tenant-hop defenses all live in `plexus_auth_core_ut1::TenantGate` now
+//! tenant-hop defenses all live in `plexus_auth_core::TenantGate` now
 //! — behavior is unchanged because the predicates were extracted verbatim
 //! (pinned by `tests/tenant_isolation_test.rs`, the same pentest suite
 //! that pinned the pre-adapter gate).
@@ -39,7 +39,7 @@
 //!
 //! # Threat model
 //!
-//! Unchanged — see `plexus_auth_core_ut1::tenant::gate` module docs for
+//! Unchanged — see `plexus_auth_core::tenant::gate` module docs for
 //! the canonical statement; `tests/tenant_isolation_test.rs` verifies each
 //! item end-to-end against the real `SqliteStore`.
 
@@ -48,10 +48,9 @@ use std::sync::Arc;
 // The handlers' AuthContext: `plexus_core::plexus::AuthContext`, which is
 // the pre-UT-1 `plexus_auth_core::AuthContext` re-export.
 use plexus_core::plexus::AuthContext;
-// The UT-1 surface (generalized gate + org_id resolver) comes from the
-// unmerged feature/UT-1-tenancy-oidc branch via the ut1-auth-core shim.
-// TODO: s/plexus_auth_core_ut1/plexus_auth_core/ once UT-1 merges.
-use plexus_auth_core_ut1::{
+// The UT-1 surface (generalized gate + org_id resolver), merged into
+// plexus-auth-core's main (0.2.0).
+use plexus_auth_core::{
     ClaimTenantResolver, GateDenial, Tenant, TenantId, TenantTagged,
 };
 use uuid::Uuid;
@@ -66,8 +65,8 @@ use crate::types::{Edge, EdgeKind, Facet};
 /// `roles`, `metadata`); they differ only in crate identity while UT-1 is
 /// unmerged. DELETE this together with the ut1-auth-core shim once
 /// feature/UT-1-tenancy-oidc merges (the types collapse into one).
-pub(crate) fn mirror_auth(ctx: &AuthContext) -> plexus_auth_core_ut1::AuthContext {
-    plexus_auth_core_ut1::AuthContext::new(
+pub(crate) fn mirror_auth(ctx: &AuthContext) -> plexus_auth_core::AuthContext {
+    plexus_auth_core::AuthContext::new(
         ctx.user_id.clone(),
         ctx.session_id.clone(),
         ctx.roles.clone(),
@@ -136,21 +135,21 @@ impl From<GateDenial> for GateError {
 /// It holds:
 ///
 /// - The shared `Arc<dyn FacetStore>` (no per-request allocation).
-/// - The generalized [`plexus_auth_core_ut1::TenantGate`] carrying the
+/// - The generalized [`plexus_auth_core::TenantGate`] carrying the
 ///   caller's resolved [`Tenant`] (or anonymous).
 ///
 /// All accessors enforce the visibility / write predicates via the
 /// generalized gate.
 pub struct TenantGate {
     store: Arc<dyn FacetStore>,
-    gate: plexus_auth_core_ut1::TenantGate,
+    gate: plexus_auth_core::TenantGate,
 }
 
 impl TenantGate {
     /// Build a gate for the given store and (optional) caller context.
     ///
     /// Resolution flow (now inside
-    /// `plexus_auth_core_ut1::TenantGate::from_auth`):
+    /// `plexus_auth_core::TenantGate::from_auth`):
     ///
     /// 1. `auth == None` → anonymous gate.
     /// 2. `auth.is_authenticated() == false` → anonymous gate (the
@@ -168,7 +167,7 @@ impl TenantGate {
         let mirrored = auth.map(mirror_auth);
         let resolver = ClaimTenantResolver::new();
         let gate =
-            plexus_auth_core_ut1::TenantGate::from_auth(&resolver, mirrored.as_ref()).await;
+            plexus_auth_core::TenantGate::from_auth(&resolver, mirrored.as_ref()).await;
         Self { store, gate }
     }
 
@@ -180,7 +179,7 @@ impl TenantGate {
     /// Visibility predicate: can the caller see this facet?
     ///
     /// Delegates to the generalized gate's matrix (see
-    /// `plexus_auth_core_ut1::TenantGate` docs):
+    /// `plexus_auth_core::TenantGate` docs):
     ///
     /// | caller     | facet.tenant   | result |
     /// |------------|----------------|--------|
@@ -207,7 +206,7 @@ impl TenantGate {
     /// - Requires an authenticated caller; anonymous callers receive
     ///   [`GateError::Unauthenticated`] (via `stamp`).
     /// - **Forces** `facet.meta.extra["tenant"]` to the caller's resolved
-    ///   tenant ([`plexus_auth_core_ut1::TenantGate::stamp`]), overwriting
+    ///   tenant ([`plexus_auth_core::TenantGate::stamp`]), overwriting
     ///   any forged value the caller may have tried to set. This is the
     ///   structural fix for the "tenant hop via create metadata" attack.
     pub async fn create(&self, mut facet: Facet) -> Result<Facet, GateError> {
@@ -229,7 +228,7 @@ impl TenantGate {
     /// the caller cannot see it. The two cases are indistinguishable to the
     /// caller by design — a foreign-tenant probe cannot use the gate as an
     /// existence oracle
-    /// ([`plexus_auth_core_ut1::TenantGate::authorize_read_of`]).
+    /// ([`plexus_auth_core::TenantGate::authorize_read_of`]).
     pub async fn get(&self, id: Uuid) -> Result<Facet, GateError> {
         let facet = match self.store.get_facet(id).await {
             Ok(f) => f,
@@ -246,7 +245,7 @@ impl TenantGate {
     ///   "exists, foreign tenant" is the only path that returns `Forbidden`).
     /// - Returns [`GateError::Unauthenticated`] for anonymous callers,
     ///   [`GateError::Forbidden`] for cross-tenant writes
-    ///   ([`plexus_auth_core_ut1::TenantGate::authorize_write_of`]).
+    ///   ([`plexus_auth_core::TenantGate::authorize_write_of`]).
     /// - **Preserves** the existing facet's `meta.extra["tenant"]` value
     ///   even if the supplied `facet` mutates it. This is the structural fix
     ///   for the "tenant hop via update" attack (threat-model item 4's
@@ -529,7 +528,7 @@ impl TenantGate {
 #[cfg(test)]
 mod tests {
     //! In-module sanity tests for the gate predicates (now delegated to the
-    //! generalized `plexus_auth_core_ut1::TenantGate`). End-to-end pentest
+    //! generalized `plexus_auth_core::TenantGate`). End-to-end pentest
     //! coverage lives in `tests/tenant_isolation_test.rs`.
 
     use super::*;

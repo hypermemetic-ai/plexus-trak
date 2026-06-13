@@ -22,7 +22,7 @@ path = "src/bin/main.rs"
 # `plexus_core::plexus::AuthContext` IS `plexus_auth_core::AuthContext`,
 # so the field-mirroring shim in `TenantGate::from_auth` is gone and the
 # trak handlers + resolver primitive share one type.
-plexus-core = { path = "../plexus-core", version = "0.5" }
+plexus-core = { path = "../plexus-core", version = "0.6" }
 # Workspace path deps for the rest of the plexus stack. Required because
 # `plexus-transport` (and `plexus-macros`) pin a workspace `plexus-core`
 # via path; mixing path-dep `plexus-core` here with crates.io
@@ -37,34 +37,21 @@ plexus-core = { path = "../plexus-core", version = "0.5" }
 # carried (`Option<&AuthContext>` pass-through; `auth: &AuthContext`
 # fail-closed to Unauthenticated at dispatch) is present.
 plexus-macros = { path = "../plexus-macros" }
-plexus-transport = { path = "../plexus-transport", version = "0.3" }
+plexus-transport = { path = "../plexus-transport", version = "0.4" }
 
 # Sealed auth primitives (AuthContext re-export target, schema marker
 # machinery the `plexus_macros::activation` codegen references by the
 # literal path `plexus_auth_core::...`). MUST stay the same package id
 # plexus-core uses, or every macro expansion in this crate type-errors.
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.1" }
-
-# UT-1 primitives: the generalized TenantGate (predicates / GateDenial /
-# TenantTagged), the org_id-default ClaimTenantResolver, and the OIDC
-# validator (`oidc::OidcSessionValidator` / `oidc::OidcValidator`) — from
-# the UNMERGED feature/UT-1-tenancy-oidc branch, via the local shim crate
-# (see ut1-auth-core/Cargo.toml for the full why: cargo lockfile collision
-# rules out a second path dep; a renamed direct dep breaks the
-# `plexus_macros::activation` codegen's proc-macro-crate resolution).
 #
-# ████████████████████████████████████████████████████████████████████████
-# TODO: repoint to ../plexus-auth-core once feature/UT-1-tenancy-oidc
-# merges — delete this dep + the ut1-auth-core/ shim crate, and
-# s/plexus_auth_core_ut1/plexus_auth_core/ across src/ + tests/. Also
-# delete the UT-W3-MIRROR shims (grep "UT-W3-MIRROR" in src/auth.rs /
-# src/tenant_gate.rs).
-# ████████████████████████████████████████████████████████████████████████
-#
-# CONSEQUENCE while unmerged: `plexus_core::plexus::AuthContext` is NOT the
-# same nominal type as `plexus_auth_core_ut1::AuthContext`. The
-# field-for-field mirror shims (grep "UT-W3-MIRROR") bridge the two.
-plexus-auth-core-ut1 = { path = "ut1-auth-core", version = "0.1" }
+# UT-1 has merged into plexus-auth-core's main (now 0.2.0), so the
+# generalized TenantGate, the org_id-default ClaimTenantResolver, and the
+# OIDC validator (`oidc::OidcSessionValidator` / `oidc::OidcValidator`) now
+# live here directly — the former ut1-auth-core/ shim crate is gone.
+# `oidc-reqwest` enables the batteries-included discovery/JWKS HTTP fetcher
+# (`oidc::ReqwestJwksFetcher`) that the production `OidcValidator::new`
+# (src/auth.rs) and src/bin/main.rs wire in.
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.2", features = ["oidc-reqwest"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }

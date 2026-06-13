@@ -17,7 +17,7 @@
 //!    `jti`, else the token's signature segment) and resolve a tenant.
 //!
 //! 3. **Gate-adapter equivalence** (UT-1 AC2): with trak's `TenantGate`
-//!    now a thin adapter over `plexus_auth_core_ut1::TenantGate`, the
+//!    now a thin adapter over `plexus_auth_core::TenantGate`, the
 //!    wire-visible isolation contract is unchanged — cross-tenant read →
 //!    `not_found`, cross-tenant write → `forbidden` — proven end-to-end
 //!    through the activation dispatch with OIDC-minted AuthContexts.

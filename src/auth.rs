@@ -6,7 +6,7 @@
 //! process that could read `~/Library/Application Support/trak/jwt_secret`
 //! could mint admin / cross-tenant tokens indistinguishable from real
 //! logins (issue 74103adf, demonstrated live). Validation now routes
-//! through [`plexus_auth_core_ut1::oidc::OidcSessionValidator`]:
+//! through [`plexus_auth_core::oidc::OidcSessionValidator`]:
 //!
 //! 1. issuer config → OIDC discovery → JWKS (cached per AUTH-8 policy);
 //! 2. RS256 signature by `kid` + `iss`/`aud`/`exp`/`iat` with zero leeway;
@@ -29,11 +29,10 @@
 
 use async_trait::async_trait;
 use plexus_core::plexus::{AuthContext, SessionValidator};
-// TODO: s/plexus_auth_core_ut1/plexus_auth_core/ once feature/UT-1-tenancy-oidc merges.
-use plexus_auth_core_ut1::oidc::{
+use plexus_auth_core::oidc::{
     Audience, OidcConfig, OidcSessionValidator, OidcValidator,
 };
-use plexus_auth_core_ut1::{IssuerUrl, SessionValidator as Ut1SessionValidator};
+use plexus_auth_core::IssuerUrl;
 use sha2::{Digest, Sha256};
 
 use crate::store::identity::IdentityStore;
@@ -66,7 +65,7 @@ pub fn oidc_config(issuer: &str, audience: &str) -> anyhow::Result<OidcConfig> {
 /// `plexus_core::plexus::AuthContext`. Identical structs, distinct crate
 /// identities while UT-1 is unmerged. DELETE together with the
 /// ut1-auth-core shim once feature/UT-1-tenancy-oidc merges.
-fn mirror_auth_back(ctx: plexus_auth_core_ut1::AuthContext) -> AuthContext {
+fn mirror_auth_back(ctx: plexus_auth_core::AuthContext) -> AuthContext {
     AuthContext::new(ctx.user_id, ctx.session_id, ctx.roles, ctx.metadata)
 }
 

@@ -8,9 +8,6 @@
 //! (openssl) generated key UT-1's suite uses; it cannot mint
 //! production-trusted tokens because production validators discover keys
 //! from their configured issuer, not from these fixtures.
-//!
-//! TODO: s/plexus_auth_core_ut1/plexus_auth_core/ once
-//! feature/UT-1-tenancy-oidc merges.
 
 #![allow(dead_code)] // each integration test binary uses a subset
 
@@ -20,10 +17,10 @@ use async_trait::async_trait;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde_json::json;
 
-use plexus_auth_core_ut1::oidc::{
+use plexus_auth_core::oidc::{
     Audience, FetchError, FetchedDocument, JwksFetcher, OidcConfig, OidcValidator,
 };
-use plexus_auth_core_ut1::IssuerUrl;
+use plexus_auth_core::IssuerUrl;
 use plexus_trak::auth::TrakAuth;
 use plexus_trak::store::identity::IdentityStore;
 

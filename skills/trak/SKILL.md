@@ -16,7 +16,8 @@ trak is a Plexus backend; there is no `trak` binary. You drive it through the **
 | ticket (any kind) | a **facet** — `facet create`, one UUID id |
 | scope · execution · build · spike | facets distinguished by **title prefix** (`Scope:` · `Execution ·` · `B<N> ·` · `S<N> · Spike:`) — not a typed field |
 | containment (execution owns its children) | **`parent_id`** tree — `create {parent_id}`, reparent with `move_to` |
-| dependency edge (A depends on B) | typed edge **`depends_on`** — `facet link {from_id:A, to_id:B, kind:"depends_on"}` |
+| dependency edge (A depends on B) | typed edge **`depends_on`** — `facet link --from-id A --to-id B --kind depends_on` (load-bearing: drives `facet blocked`) |
+| evidence / research edge (A supports B) | typed edge **`supports`** — `facet link --from-id A --to-id B --kind supports`. **Advisory — NOT read by `facet blocked`.** A research spike `supports` the scope/execution/build it underpins, and points at found documents or another DAG's head as evidence. |
 | the readiness query ("what's ready / blocked") | **`facet blocked`** — returns facets with a `depends_on` target not yet `done` |
 | `## Provides` / `## Consumes` | prose in the facet **`body`**; the edges they imply are the `depends_on` links |
 | confidence / severity / framework | **`meta_extra`** keys (`priority` is first-class; arbitrary keys via `meta_extra`) |
@@ -85,6 +86,11 @@ synapse -P 44107 -j trak facet create --title "S1 · Spike: any bypass writers?"
 # Dependency edge: B1 depends_on B0 (derive every edge from ## Consumes → its producing ## Provides)
 synapse -P 44107 -j trak facet link --from-id <B1_UUID> --to-id <B0_UUID> --kind depends_on
 
+# Evidence/research edge: a research spike SUPPORTS the scope it births (advisory — never blocks readiness)
+synapse -P 44107 -j trak facet link --from-id <SPIKE_UUID> --to-id <SCOPE_UUID> --kind supports
+# …and cites found brownfield docs as evidence — gives orphans a home without touching the DAG
+synapse -P 44107 -j trak facet link --from-id <SPIKE_UUID> --to-id <FOUND_DOC_UUID> --kind supports
+
 # Readiness query — what is BLOCKED under this execution (deps not yet done)
 synapse -P 44107 -j trak facet blocked --parent-id <EXEC_UUID>
 
@@ -112,6 +118,16 @@ synapse -P 44107    trak facet create                               # bare call 
 ```
 
 > `--meta-extra` is the one param whose value is a JSON object — pass it as `--meta-extra '{"key":"value"}'`. Every other param is a plain `--flag value`.
+
+## Brownfield — arranging found material
+
+When a `facet search`/`grep` surfaces a pile of orphan facets or documents with **no relationships**, don't leave them loose and don't force them into the dependency DAG. Metabolize them with a **research spike** (an ordinary spike, `S<N> · Spike: …` — there is no separate "research" node kind):
+
+1. Create the spike — often at the front of the line, since it will `supports`/birth the scope (`user input → spike → scope`).
+2. Cite every found doc as evidence: `facet link --from-id <SPIKE> --to-id <DOC> --kind supports`. The orphans now have a home.
+3. `supports` the scope/execution the research underpins — and to bridge into *another* body of work, `supports` **that DAG's head node**. Because `supports` is advisory (invisible to `facet blocked`), it connects freely across the tree without blocking anything.
+
+The spike's binary pass/fail (the AND of its children if it spawned sub-spikes — any child fail ⇒ parent fails) then drives whether the scope it supports proceeds as assumed or with **revised assumptions** (the consumer salvages what the evidence still supports). See the methodology + planning skills for the spike-as-research model.
 
 ## Current-work query (what `/orient` runs)
 

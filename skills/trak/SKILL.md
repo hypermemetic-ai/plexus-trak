@@ -51,56 +51,72 @@ Identity is **plexus-idp (OIDC/RS256)**, not trak. Reads of *public* facets work
 
 ## Invocation form
 
+**synapse is a normal CLI: every parameter is its own `--flag`.** Do NOT reach for a `-p '{json}'` blob — pass each param as `--kebab-case-flag value`:
+
 ```
-synapse -P 44107 -j trak <hub> <method> -p '{<json, underscore_keys>}'
+synapse -P 44107 -j trak <hub> <method> --param value --other-param value
 ```
-Flags and `-p` come **before** `trak`. `-P 44107` = the trak port; `-j` = raw JSON. Responses are newline-delimited `{"type":"data",...}` envelopes ending in `{"type":"done"}`; errors are `{"type":"error","code":...}`. Pull a new id with `… | jq -r 'select(.type=="data").content.facet.id'`. **Full UUIDs only** — short/prefix ids error or silently no-op.
+- **Global flags before `trak`** (`-P 44107` = trak's port, `-j` = raw JSON); **method `--params` after the method.**
+- Param flags are **kebab-case** (`--parent-id`, `--meta-extra`, `--from-id`) even though the underlying JSON keys are underscore. **List flags repeat:** `--tags build --tags cleanup`.
+- **Let the backend tell you the flags** — call the method bare (`synapse -P 44107 trak facet create`) or `--help` (`synapse -P 44107 trak facet create --help`); it prints each `--flag`, required/optional, and its doc. Don't hand-author param names from memory.
+- Responses are newline-delimited `{"type":"data",...}` envelopes ending in `{"type":"done"}`; errors are `{"type":"error","code":...}`. Capture a new id with `… | jq -r 'select(.type=="data").content.facet.id'` (or a small python parser).
+- **Full UUIDs only** — short/prefix ids error or silently no-op.
+
+> The `-p '{json}'` form still works and is only needed when a single param value is itself a nested JSON object (e.g. `--meta-extra '{"change":"<url>"}'`). For everything else, **flags are the default.**
 
 ## Operations (the methodology, executed)
 
 ```bash
 # Scope ticket (milestone root) — Pending until the human ratifies
-synapse -P 44107 -j trak facet create -p '{"title":"Scope: M9 · audit log","body":"## Language …\n## Interface contract …","status":"pending","tags":["scope"]}'
+synapse -P 44107 -j trak facet create --title "Scope: M9 · audit log" \
+  --body "## Language …
+## Interface contract …" --status pending --tags scope
 
 # Execution ticket — child of nothing (milestone-level) or of a parent program; owns the DAG
-synapse -P 44107 -j trak facet create -p '{"title":"Execution · M9 · audit log","body":"## Execution DAG …","status":"active","parent_id":"<MILESTONE_OR_ROOT_UUID>","tags":["execution"]}'
+synapse -P 44107 -j trak facet create --title "Execution · M9 · audit log" \
+  --body "## Execution DAG …" --status active --parent-id <MILESTONE_OR_ROOT_UUID> --tags execution
 
 # Build / spike — child of the execution ticket
-synapse -P 44107 -j trak facet create -p '{"title":"B0 · AuditEvent type root","body":"## Provides …","status":"pending","parent_id":"<EXEC_UUID>","tags":["build"]}'
-synapse -P 44107 -j trak facet create -p '{"title":"S1 · Spike: any bypass writers?","status":"pending","parent_id":"<EXEC_UUID>","tags":["spike"]}'
+synapse -P 44107 -j trak facet create --title "B0 · AuditEvent type root" \
+  --body "## Provides …" --status pending --parent-id <EXEC_UUID> --tags build
+synapse -P 44107 -j trak facet create --title "S1 · Spike: any bypass writers?" \
+  --status pending --parent-id <EXEC_UUID> --tags spike
 
 # Dependency edge: B1 depends_on B0 (derive every edge from ## Consumes → its producing ## Provides)
-synapse -P 44107 -j trak facet link -p '{"from_id":"<B1_UUID>","to_id":"<B0_UUID>","kind":"depends_on"}'
+synapse -P 44107 -j trak facet link --from-id <B1_UUID> --to-id <B0_UUID> --kind depends_on
 
-# Readiness query — what is actionable (deps all done) under this execution
-synapse -P 44107 -j trak facet blocked -p '{"parent_id":"<EXEC_UUID>"}'   # returns the BLOCKED ones
+# Readiness query — what is BLOCKED under this execution (deps not yet done)
+synapse -P 44107 -j trak facet blocked --parent-id <EXEC_UUID>
 
 # Ratify (human) / start / finish / land
-synapse -P 44107 -j trak facet update -p '{"id":"<UUID>","status":"ready"}'      # Pending → Ready
-synapse -P 44107 -j trak facet update -p '{"id":"<UUID>","status":"active"}'     # claim the leaf
-synapse -P 44107 -j trak facet update -p '{"id":"<UUID>","status":"in-review","meta_extra":{"change":"<PR-or-commit-url>"}}'
-synapse -P 44107 -j trak facet update -p '{"id":"<UUID>","status":"done"}'       # exact string — unblocks dependents
+synapse -P 44107 -j trak facet update --id <UUID> --status ready      # Pending → Ready
+synapse -P 44107 -j trak facet update --id <UUID> --status active     # claim the leaf
+synapse -P 44107 -j trak facet update --id <UUID> --status in-review --meta-extra '{"change":"<PR-or-commit-url>"}'
+synapse -P 44107 -j trak facet update --id <UUID> --status done       # exact string — unblocks dependents
 
 # Propagate a DAG change ONTO the execution ticket in the same unit of work (the parent's body is the DAG's truth)
-synapse -P 44107 -j trak facet update -p '{"id":"<EXEC_UUID>","body":"<updated ## Execution DAG + ## The work>"}'
+synapse -P 44107 -j trak facet update --id <EXEC_UUID> --body "<updated ## Execution DAG + ## The work>"
 
 # Archive superseded work — never silent; leave a pointer
-synapse -P 44107 -j trak facet update  -p '{"id":"<UUID>","status":"archived"}'
-synapse -P 44107 -j trak discuss comment -p '{"facet_id":"<UUID>","body":"Superseded by <SURVIVOR_UUID> — archive tag <tag>, removal commit <sha>."}'
+synapse -P 44107 -j trak facet update --id <UUID> --status archived
+synapse -P 44107 -j trak discuss comment --facet-id <UUID> \
+  --body "Superseded by <SURVIVOR_UUID> — archive tag <tag>, removal commit <sha>."
 
 # Inspect / navigate
-synapse -P 44107 -j trak facet tree   -p '{"id":"<EXEC_UUID>"}'      # the whole subtree
-synapse -P 44107 -j trak facet list   -p '{"parent_id":"<UUID>"}'    # direct children
-synapse -P 44107 -j trak facet links  -p '{"id":"<UUID>","direction":"both"}'
-synapse -P 44107 -j trak facet search -p '{"query":"audit"}'         # FTS5 over title+body
-synapse -P 44107 -j trak facet grep   -p '{"pattern":"(?i)retention"}'
-synapse -P 44107 -s trak facet                                       # raw param schema for every method
+synapse -P 44107 -j trak facet tree   --id <EXEC_UUID>                # the whole subtree
+synapse -P 44107 -j trak facet list   --parent-id <UUID>             # direct children
+synapse -P 44107 -j trak facet links  --id <UUID> --direction both   # 'both' is authoritative; 'out' may not echo edges
+synapse -P 44107 -j trak facet search --query "audit"                # FTS5 over title+body
+synapse -P 44107 -j trak facet grep   --pattern "(?i)retention"
+synapse -P 44107    trak facet create                               # bare call → prints every --flag (and --help works too)
 ```
+
+> `--meta-extra` is the one param whose value is a JSON object — pass it as `--meta-extra '{"key":"value"}'`. Every other param is a plain `--flag value`.
 
 ## Current-work query (what `/orient` runs)
 
 To answer "where am I / what's in flight" against trak:
-1. **In progress:** facets with `status:"active"` — `facet grep -p '{"pattern":".","status":"active"}'` (optionally scoped by `parent_id`).
+1. **In progress:** facets with `status:"active"` — `facet grep --pattern "." --status active` (optionally `--parent-id <UUID>`).
 2. **Awaiting me:** `status:"in-review"` (handed off, may need a nudge) and `status:"ready"` (ratified, startable).
 3. **Blocked vs ready:** `facet blocked` under the live execution ticket(s) — anything NOT returned, and `ready`/`pending`, is actionable.
 4. **Each active execution ticket:** `facet tree` it to see leaf states at a glance.

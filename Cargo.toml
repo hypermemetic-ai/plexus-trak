@@ -22,7 +22,7 @@ path = "src/bin/main.rs"
 # `plexus_core::plexus::AuthContext` IS `plexus_auth_core::AuthContext`,
 # so the field-mirroring shim in `TenantGate::from_auth` is gone and the
 # trak handlers + resolver primitive share one type.
-plexus-core = { path = "../plexus-core", version = "0.5" }
+plexus-core = { path = "../plexus-core", version = "0.6" }
 # Workspace path deps for the rest of the plexus stack. Required because
 # `plexus-transport` (and `plexus-macros`) pin a workspace `plexus-core`
 # via path; mixing path-dep `plexus-core` here with crates.io
@@ -38,12 +38,12 @@ plexus-core = { path = "../plexus-core", version = "0.5" }
 # source (found by R-5 of the ROLES+AP wave; fixed under
 # R-7 2e5058cd-fa96-4d14-bcf6-44f62e204ff0).
 plexus-macros = { path = "../plexus-macros" }
-plexus-transport = { path = "../plexus-transport", version = "0.3" }
+plexus-transport = { path = "../plexus-transport", version = "0.4" }
 
 # Sealed auth primitives (Tenant, ClaimTenantResolver, AuthContext).
 # Path dep so the AuthContext type used in trak handlers is identical to the
 # one expected by `ClaimTenantResolver::resolve`.
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.1" }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.2" }
 
 # Async
 tokio = { version = "1", features = ["full"] }
